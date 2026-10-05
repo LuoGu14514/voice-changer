@@ -27,4 +27,19 @@ _check_*.py
 _perf_*.py
 _research_*.py
 _research_*.txt
+_find_*.py
+_verify_*.py
+_audit_*.py
+*.bak.py
+*.bak
 *.tmp
+
+# RVC models (large binaries — download separately)
+models/*.onnx
+models/*.pth
+models/*.pt
+models/*.index
+models/*.npy
+# but keep the README
+!models/README.txt
+!models/*.md

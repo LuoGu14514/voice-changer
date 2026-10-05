@@ -295,3 +295,70 @@ v0.4 起每个预设都预设了具体的效果组合，让声音更像真角色
 python -m venv .venv
 .venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
+
+
+## 七、RVC 角色音色（v0.6.0 新增，可选）
+
+如果你想用「训练好的角色音色」（如崩坏：星穹铁汉 / 原神 / 任意中文女声）而不只是升降调 + 效果器，
+可以接 **RVC v2** 推理。RVC 是开源的「声音转换」模型，能把一段音频直接变换成另一个角色的音色（音高、节奏不变）。
+
+### v0.6.0 与 v0.5.x 的区别
+
+| 版本 | 内容 | 听感 |
+| --- | --- | --- |
+| **v0.6.0** ← 当前 | 回到 v0.2.0 干净基线 + 新增 `rvc_infer.py` RVC 推理骨架 | 8 个 DSP 预设 + 可选 RVC 任意角色 |
+| v0.5.x（已废弃） | 试加 LPC 共振峰 / 随机相位 / jitter 等 | 用户报告有电音 / 杂音，已废弃 |
+
+### 怎么装 RVC 模型
+
+1. **下载**一个 RVC v2 模型（`.onnx` 优先，`.pth` 也行）。推荐来源：
+   - https://weights.gg （需 VPN，国内可访问镜像站：搜索「B 站 RVC 整合包」）
+   - 找「中文 / Mandarin / 女声 / Female」，**尽量不要用角色专属（如「三月七专用」等）** —— 版权 + 过拟合风险
+   - 干净样本（5-20 分钟录音）训练出的模型质量最好
+2. 把 `.onnx` / `.pth` 文件丢到 `models/` 目录
+3. 如果有 `.index`（Faiss 检索增强），一起丢进去能提升还原度
+
+### 怎么用
+
+命令行模式（最简单的「文件变声」）：
+
+```bat
+.venv\Scripts\python.exe rvc_infer.py -i 输入.wav -o 输出.wav -m models\中文女声.onnx
+```
+
+带 index：
+
+```bat
+.venv\Scripts\python.exe rvc_infer.py -i 输入.wav -o 输出.wav -m models\中文女声.onnx --index models\中文女声.index
+```
+
+验证模型已识别：
+
+```bat
+.venv\Scripts\python.exe verify_rvc.py
+```
+
+输出形如：
+
+```
+ONNX models: 1
+  - chinese-female.onnx (87.3 MB)
+[OK] Model loaded, ready to infer!
+```
+
+### 实时模式
+
+实时模式（麦克风 → RVC → 虚拟声卡）需要把 RVC 推理融合进 `voice_changer.py` 的 audio callback。
+这一部分还在做，等你下完模型我们再接通。RVC 推理开销比 DSP 大很多（CPU 单核约 0.5-1.5x 实时），
+AMD 集显卡上勉强能跑，建议块大小 1024 或更大。
+
+### 已知限制
+
+- **只能跑 ONNX 推理**（CPU 模式）。`.pth` 需要 `pip install torch>=2.0` 后用 fairseq 加载
+- **没有内置 HuBERT 翻译** —— 目前 `rvc_infer.py` 的 `hubert_dummy()` 是占位 0，ONNX 推理出来的结果会失真
+- **真正能用的 RVC 实时**需要 torch + chinese-hubert-base (360MB) + rmvpe F0 估计 (~10MB)
+- 完整 RVC 流水线的搭建可以下一步做
+
+### 模型下载（参见 `models/README.txt`）
+
+`models/` 目录有一个 README，详细列了从哪些地方下载模型、推荐选择、文件名建议等。
