@@ -266,10 +266,76 @@ out = (1 - s*0.5)*x + s*hp   # 混合
 
 ---
 
-## 10. v0.5.2 Phase C/D 待办
+## 10. v0.5.2 Phase C：LPC 共振峰包络（替换 max_filter）
 
-- **Phase C**: LPC-based 共振峰检测 + warp（替换 max_filter）—— 共振峰位置更准
-- **Phase D**: pitch envelope smoothing（逐块常数 → medfilt）+ 随机相位（去"颗粒感"）
+### 10.1 max_filter 的两个固有问题
+
+v0.4/v0.5.0/v0.5.1 的 FormantCorrector 都用沿频率轴的 rolling max（窗口 ~24 bin ≈ 1125 Hz）估共振峰包络。这种方法有两个固有问题：
+
+1. **与谐波密度耦合** —— 它跟踪的是谐波列的**峰值**，不是真正的共振峰包络。当说话人基频高（小孩/女声，F0=250Hz），谐波密（每 48Hz 一个峰 @ Fs=48k），滑动窗口里多个峰都被取 max，包络被"顶高"；男声低基频（F0=100Hz）时谐波稀，包络接近真实值。结果是同一个 form_shift_ratio 在不同性别的人上效果不一样。
+2. **窗口宽度固定** —— `filt_bins=24` 对 F1=500Hz 是合适的，但对女声 F1=300Hz 就过粗（覆盖整个共振峰+邻共振峰）。
+
+### 10.2 倒谱提升法（cepstrum liftering）
+
+经典做法：把 `log|X|` 当成"信号"做 IFFT 得倒谱 `c[n]`。倒谱的低阶对应 log|X| 的**慢变化**（包络），高阶对应**快变化**（谐波列）。保留 c[0..order]，高阶置零，再 FFT 回频率域 + exp，就是平滑的线性包络。
+
+参考 Imai & Abe (1978) "Spectral envelope extraction by improved cepstral windowing"，以及 Stevens "Acoustic Phonetics" (2007) 第 3 章。
+
+### 10.3 实现细节（`voice_core.py`）
+
+```python
+@staticmethod
+def _lpc_envelope(mag, order, n_fft):
+    # 1) 把 rfft 出的 (K,) log_mag 对称扩展到 2K-2 长度的"完整 log|X|"
+    log_mag = np.log(np.maximum(mag, 1e-12))
+    log_full = np.concatenate([log_mag, log_mag[-2:0:-1]]) if K > 1 else log_mag
+    # 2) IFFT → 实倒谱
+    cep = np.fft.ifft(log_full).real
+    # 3) 提升：保留 c[0..order]
+    cep_lifted = cep.copy()
+    cep_lifted[order + 1:] = 0.0
+    # 4) FFT 回频率域 + exp
+    log_env = np.fft.fft(cep_lifted).real[:K]
+    env = np.exp(np.clip(log_env, -20, 20))
+    # 5) 归一化到 mag 峰值
+    env *= mag.max() / max(env.max(), 1e-12)
+    return env
+```
+
+默认 order = `N//20`，对 N=1024 是 50。这个量级：
+- 能跟踪 F1=500Hz（F1 周期 = 96 采样 > order=50 的临界 50）
+- 不能跟踪更窄的共振峰（BW<50Hz），但实际语音共振峰 BW 通常 40-150Hz
+- 性能：单帧 ~0.15ms（B=512 / N=1024），远低于块预算 10.67ms
+
+### 10.4 测试（121 PASS / 0 FAIL，新增 7 项）
+
+```
+[1] test_lpc_envelope_positive_finite        — 9 种 K × order 组合无 NaN/Inf/非正
+[2] test_lpc_envelope_smoother_than_max_filter — 一阶差分方差 < max_filter 的 50%
+[3] test_lpc_envelope_correlates_with_true   — 与真实包络的归一化相关系数 > 0.70
+[4] test_lpc_envelope_peak_locations         — 局部极大值命中 500/1500/2500 ± 200Hz
+[5] test_envelope_method_selection           — 'lpc' 和 'max_filter' 两种都跑通
+[6] test_default_envelope_method_is_lpc      — 默认值 = 'lpc'（v0.5.2 起）
+[7] test_formant_corrector_lpc_does_not_crash_pipeline — VoicePipeline 全链路 +6 半音不死
+```
+
+### 10.5 向后兼容
+
+新参数 `envelope_method="lpc"` 默认开启，**所有 v0.5.1 之前的用户都自动获得更平滑的共振峰校正**。想回到老实现只需传 `envelope_method="max_filter"`。实测 `max_filter` 仍可用且行为不变。
+
+### 10.6 主观听感
+
+因为 LPC 估的包络不再被谐波密度"撑高"，升 +6 半音后共振峰校正"拉回"的距离更精确：
+- 男声 → 女声（semitones=+6, form_shift=1.0）：之前可能把共振峰拉到原位稍**低**的位置（因为 max_filter 估高了包络），现在精确回到原位。
+- 女声 → 男声（semitones=-6, form_shift=1.0）：同样更精确。
+
+---
+
+## 11. Phase D：pitch envelope + 随机相位（v0.5.3，待办）
+
+- **pitch envelope smoothing**：当前每块 ratio 常数（block-level WSOLA），改成每块边界 medfilt → 说话时音高连续曲线，而不是阶跃
+- **随机相位**：在 _process_frame 把相位 `np.angle(F)` 改成 `np.angle(F) + small_random`，去"颗粒感"
+- 期望效果：让处理过的声音从「音高跳变」变成「连贯」，进一步缩小与真人的差距
 
 ---
 

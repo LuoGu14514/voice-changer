@@ -651,6 +651,147 @@ def test_breath_v2_per_block_latency():
           f"mean={times.mean():.3f}ms max={times.max():.3f}ms budget<{budget_ms:.2f}ms")
 
 
+# ---------------------------------------------------------------- Phase C: LPC 共振峰包络
+def test_lpc_envelope_positive_finite():
+    """LPC 包络永远严格 > 0 且无 NaN/Inf。"""
+    rng = np.random.default_rng(11)
+    for K in (129, 513, 1025):
+        mag = np.abs(rng.standard_normal(K).astype(np.float32)) + 0.01
+        for order in (40, 80, 128):
+            env = vc.FormantCorrector._lpc_envelope(mag, order=order, n_fft=(K - 1) * 2)
+            check(f"LPC 包络 finite K={K} order={order}",
+                  bool(np.all(np.isfinite(env))), f"NaN/Inf count={int(np.sum(~np.isfinite(env)))}")
+            check(f"LPC 包络 strictly > 0 K={K} order={order}",
+                  bool(np.all(env > 0)), f"min(env)={float(env.min()):.2e}")
+
+
+def test_lpc_envelope_smoother_than_max_filter():
+    """LPC 包络的一阶差分方差应明显小于 max_filter（更平滑）。"""
+    rng = np.random.default_rng(13)
+    n_fft = 1024
+    # 构造有谐波 + 共振峰的合成谱
+    freqs = np.fft.rfftfreq(n_fft, 1.0 / SR)
+    mag = np.ones_like(freqs)
+    for k in range(1, 25):
+        f = k * 200.0
+        idx = int(round(f / (SR / n_fft)))
+        if 0 <= idx < mag.size:
+            mag[idx] = 5.0
+    for fc, bw in [(500, 80), (1500, 100), (2500, 130)]:
+        mag += 5.0 * np.exp(-0.5 * ((freqs - fc) / bw) ** 2)
+    mag = mag.astype(np.float32) + 0.01 * rng.standard_normal(mag.size).astype(np.float32)
+    mag = np.abs(mag).astype(np.float32)
+    env_lpc = vc.FormantCorrector._lpc_envelope(mag, order=50, n_fft=n_fft)
+    env_max = vc.FormantCorrector._max_filter_1d(mag, size=24)
+    var_lpc = float(np.var(np.diff(env_lpc)))
+    var_max = float(np.var(np.diff(env_max)))
+    check("LPC 包络明显比 max_filter 平滑",
+          var_lpc < var_max * 0.5,
+          f"var_lpc={var_lpc:.4f} var_max={var_max:.4f} ratio={var_lpc/var_max:.2f}")
+
+
+def test_lpc_envelope_correlates_with_true():
+    """LPC 包络的形状（归一化）与真实包络显著正相关。"""
+    n_fft = 1024
+    freqs = np.fft.rfftfreq(n_fft, 1.0 / SR)
+    true_env = np.ones_like(freqs)
+    for fc, bw in [(500, 80), (1500, 100), (2500, 130)]:
+        true_env += 5.0 * np.exp(-0.5 * ((freqs - fc) / bw) ** 2)
+    mag = true_env.copy()
+    for k in range(1, 25):
+        f = k * 200.0
+        idx = int(round(f / (SR / n_fft)))
+        if 0 <= idx < mag.size:
+            mag[idx] = max(mag[idx], 1.0)
+    rng = np.random.default_rng(42)
+    phase = rng.uniform(-np.pi, np.pi, mag.size).astype(np.float32)
+    F = (mag.astype(np.float32) * np.exp(1j * phase)).astype(np.complex64)
+    y = np.fft.irfft(F, n_fft).astype(np.float32)
+    y /= max(np.max(np.abs(y)), 1e-9)
+    seg = y * np.hanning(n_fft)
+    mag_obs = np.abs(np.fft.rfft(seg, n_fft)).astype(np.float32)
+    env_lpc = vc.FormantCorrector._lpc_envelope(mag_obs, order=50, n_fft=n_fft)
+    # 归一化 + 排除 DC/Nyquist
+    e1 = env_lpc[1:-1].astype(np.float64)
+    e2 = true_env[1:-1].astype(np.float64)
+    e1 = (e1 - e1.min()) / max(e1.max() - e1.min(), 1e-9)
+    e2 = (e2 - e2.min()) / max(e2.max() - e2.min(), 1e-9)
+    corr = float(np.corrcoef(e1, e2)[0, 1])
+    check("LPC 包络形状与真实包络显著正相关 (r > 0.7)",
+          corr > 0.70, f"corr={corr:.4f}")
+
+
+def test_lpc_envelope_peak_locations():
+    """LPC 包络的最大几个峰位置应至少有一个落在每个真实共振峰附近（±200Hz）。"""
+    n_fft = 1024
+    freqs = np.fft.rfftfreq(n_fft, 1.0 / SR)
+    mag = np.ones_like(freqs)
+    for fc, bw in [(500, 80), (1500, 100), (2500, 130)]:
+        mag += 5.0 * np.exp(-0.5 * ((freqs - fc) / bw) ** 2)
+    for k in range(1, 25):
+        f = k * 200.0
+        idx = int(round(f / (SR / n_fft)))
+        if 0 <= idx < mag.size:
+            mag[idx] = max(mag[idx], 1.0)
+    rng = np.random.default_rng(42)
+    phase = rng.uniform(-np.pi, np.pi, mag.size).astype(np.float32)
+    F = (mag.astype(np.float32) * np.exp(1j * phase)).astype(np.complex64)
+    y = np.fft.irfft(F, n_fft).astype(np.float32)
+    y /= max(np.max(np.abs(y)), 1e-9)
+    seg = y * np.hanning(n_fft)
+    mag_obs = np.abs(np.fft.rfft(seg, n_fft)).astype(np.float32)
+    env_lpc = vc.FormantCorrector._lpc_envelope(mag_obs, order=50, n_fft=n_fft)
+    # 找局部极大
+    peaks = []
+    for i in range(2, env_lpc.size - 2):
+        if (env_lpc[i] > env_lpc[i - 1] and env_lpc[i] > env_lpc[i + 1]
+                and env_lpc[i] > env_lpc[i - 2] and env_lpc[i] > env_lpc[i + 2]):
+            peaks.append(float(freqs[i]))
+    # 取最大的 6 个峰
+    if peaks:
+        vals = [env_lpc[int(round(p / (SR / n_fft)))] for p in peaks]
+        peaks = [p for _, p in sorted(zip(vals, peaks), reverse=True)[:6]]
+    ok_all = True
+    for tgt, tol in [(500.0, 200.0), (1500.0, 200.0), (2500.0, 250.0)]:
+        near = any(abs(p - tgt) < tol for p in peaks)
+        if not near:
+            ok_all = False
+    check("LPC 包络峰值位置命中 500/1500/2500",
+          ok_all, f"top peaks = {[int(p) for p in peaks]}")
+
+
+def test_envelope_method_selection():
+    """FormantCorrector(envelope_method='lpc'|'max_filter') 两种模式都跑得通。"""
+    x = sine(300, 0.5)
+    for method in ("lpc", "max_filter"):
+        fc = vc.FormantCorrector(512, envelope_method=method)
+        B = 512
+        pad = (-x.size) % B
+        xp = np.concatenate([x, np.zeros(pad, np.float32)])
+        out = np.concatenate([fc.process(xp[i:i + B], 1.0, 1.0)
+                              for i in range(0, xp.size, B)])
+        check(f"FormantCorrector envelope_method='{method}' 不崩",
+              bool(np.all(np.isfinite(out))) and rms(out) > 0,
+              f"rms={rms(out):.3f}")
+
+
+def test_default_envelope_method_is_lpc():
+    """默认 envelope_method 应该是 'lpc'（v0.5.2 起）。"""
+    fc = vc.FormantCorrector(512)
+    check("FormantCorrector 默认 envelope_method = 'lpc'",
+          fc.envelope_method == "lpc", f"got '{fc.envelope_method}'")
+
+
+def test_formant_corrector_lpc_does_not_crash_pipeline():
+    """VoicePipeline 默认开启 LPC 共振峰包络时，整链路跑 +6 半音不死。"""
+    y = vowel_like(f0=180.0, formants=(500.0, 1500.0, 2500.0), dur=1.0)
+    y2 = vc.process_offline(y, SR, semitones=6.0,
+                            formant_correct=True, form_shift_ratio=1.0)
+    check("VoicePipeline + LPC 共振峰校正（+6 半音）跑通",
+          bool(np.all(np.isfinite(y2))) and 0.1 < rms(y2) / rms(y) < 3.0,
+          f"rms_in={rms(y):.3f} rms_out={rms(y2):.3f}")
+
+
 def main():
     print(f"numpy {np.__version__}, 采样率 {SR}\n")
     for fn in (test_identity_exact, test_identity_noise, test_pitch_ratio, test_duration_and_rms,
@@ -667,7 +808,11 @@ def main():
                test_breath_v2_disabled, test_breath_v2_no_nan_inf,
                test_breath_v2_f0_sync, test_breath_v2_color_aspirated,
                test_breath_v2_color_breathy, test_breath_v2_puff_modulation,
-               test_breath_v2_per_block_latency):
+               test_breath_v2_per_block_latency,
+               test_lpc_envelope_positive_finite, test_lpc_envelope_smoother_than_max_filter,
+               test_lpc_envelope_correlates_with_true, test_lpc_envelope_peak_locations,
+               test_envelope_method_selection, test_default_envelope_method_is_lpc,
+               test_formant_corrector_lpc_does_not_crash_pipeline):
         print(f"--- {fn.__name__} ---")
         fn()
         print()

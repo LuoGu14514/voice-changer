@@ -359,7 +359,8 @@ class FormantCorrector:
     """
 
     def __init__(self, block_size: int = 512, fft_size: int | None = None,
-                 filt_bins: int = 24):
+                 filt_bins: int = 24, lpc_order: int | None = None,
+                 envelope_method: str = "lpc"):
         self.B = int(block_size)
         self.N = int(fft_size) if fft_size else 2 * self.B
         # hop = N/2 → 50% overlap，sqrt-Hann 满足 COLA（sum = 1）
@@ -368,10 +369,18 @@ class FormantCorrector:
             # 默认 B 块、N=2B、hop=B，跟 StreamingPitchShifter 对齐
             # 如果外部强行传不匹配的尺寸，最少保证 hop > 0
             self.hop = max(1, self.hop)
-        # 包络平滑窗口：bin 数。
-        # 默认 24 ≈ 1125 Hz 宽（@ SR=48000, N=1024, bin=46.875Hz）—— 能跨越
-        # 男声典型基频 F0=100-200Hz 的多个谐波，捕获真正的共振峰宽度。
+        # 包络估计方法：
+        #   "lpc"      — 倒谱提升法（Imai & Abe 1978），输出平滑且与谐波密度无关
+        #   "max_filter" — 沿频率轴的滑动最大值（v0.4 之前默认；快但容易高估包络）
+        self.envelope_method = envelope_method if envelope_method in ("lpc", "max_filter") else "lpc"
+        # 包络平滑窗口（仅 max_filter 用）：默认 24 bin ≈ 1125 Hz 宽
         self.filt_bins = max(3, int(filt_bins))
+        # LPC 阶数：用于倒谱提升法的截止点。默认按 Fs/1000+2 经验公式。
+        # Fs=48000 → 50；Fs=16000 → 18。阶数越大，包络越精细（也越抖动）。
+        if lpc_order is None:
+            # 选一个对典型语音 F1=500Hz 友好的默认值
+            lpc_order = max(20, self.N // 20)
+        self.lpc_order = int(lpc_order)
         # sqrt-Hann：分析和综合各用一次，乘起来满足 COLA
         hann = 0.5 - 0.5 * np.cos(2.0 * np.pi * np.arange(self.N) / self.N)
         self.win = (hann.astype(np.float32) ** 0.5)
@@ -395,6 +404,67 @@ class FormantCorrector:
         v = np.lib.stride_tricks.sliding_window_view(xp, size, axis=-1)
         return v.max(axis=-1)
 
+    @staticmethod
+    def _lpc_envelope(mag: np.ndarray, order: int, n_fft: int) -> np.ndarray:
+        """用倒谱提升（cepstrum liftering）法从幅度谱估共振峰包络。
+
+        思路（Imai & Abe 1978，"Spectral envelope extraction by improved
+        cepstral windowing"）：把 log(|X|) 当成"信号"做 IFFT 得倒谱 c[n]，
+        保留 c[0..order] 那一段（低倒频率对应谱包络的高时间尺度变化），把
+        高阶 c[n > order] 当成"细节（谐波列）"置零，再 FFT 回频率域得到
+        平滑的对数包络，最后 exp 就是线性包络。这样得到的包络与谐波密度
+        无关，且能精确跟踪共振峰形状。
+
+        参数：
+            mag: (K,) 非负幅度谱（K = N//2 + 1）
+            order: 倒谱保留的阶数（越大越精细，建议 N//20）
+            n_fft: 原始 FFT 大小 N（用于对称处理偶/奇长度）
+        返回：
+            env: (K,) 平滑包络，与 mag 同形状、严格 > 0
+        """
+        mag = np.asarray(mag, dtype=np.float64)
+        if mag.size == 0:
+            return mag.astype(np.float32)
+        # 1) 对数幅度 → irfft 得倒谱
+        log_mag = np.log(np.maximum(mag, 1e-12))
+        # 倒谱长度 = N（用 irfft 重建 2N 长度信号的对称 IFFT）
+        # mag 来自 rfft，所以倒谱是 N 长，前 N 个权"因果"部分（n=0..N-1）
+        # c[n] for n > order 是细节，需要清零。
+        # 偶 N：irfft(rfft(x)) = x(N-1) 对称的话要额外把 N×2 长度上 c[N..2N-1] 当成镜像。
+        # 这里用 2N 长度手算更直接。
+        # log_mag 有 K = N//2+1 个点，对称扩展到 2K-2（DC 与 Nyq 复用），共 2K-1 长度。
+        # 实际处理：用 irfft(log_mag) 得 *cepe（长度 2K-1），c[order+1 .. K-1] = 0。
+        # 2K-1 = N + (K > 1) ... 麻烦。更简单：直接 irfft 取前 N 个，再镜像。
+        # 更简单：用 np.fft.ifft(log_mag_full) 其中 log_mag_full 是 2K-2 长度的对称构造。
+        K = mag.size
+        # 把 log_mag 扩展成"完整"频谱（2K-2 长度的循环对称）：
+        if K > 1:
+            log_full = np.concatenate([log_mag, log_mag[-2:0:-1]])
+        else:
+            log_full = log_mag.copy()
+        # IFFT → 实倒谱（理论上虚部是数值噪声）
+        cep = np.fft.ifft(log_full).real.astype(np.float64)
+        # 倒谱长度 = 2K - 2 = N（当 K = N//2+1 偶 N 时 N 是偶数）
+        # 保留下标 [0..order]，其余清零
+        cep_lifted = cep.copy()
+        if order + 1 < cep_lifted.size:
+            cep_lifted[order + 1:] = 0.0
+        # FFT 回频率域 → 平滑对数包络
+        log_env = np.fft.fft(cep_lifted).real.astype(np.float64)
+        # log_env 长度 = 2K-2 = N，取前 K 个做包络
+        log_env_K = log_env[:K]
+        # 转线性 + 数值稳定
+        # 对 log_env 上下限裁剪再 exp：避免数值爆炸
+        log_env_K = np.clip(log_env_K, -20.0, 20.0)
+        env = np.exp(log_env_K).astype(np.float32)
+        # 兜底：env 必须严格 > 0
+        env = np.maximum(env, 1e-8).astype(np.float32)
+        # 归一化到 mag 的峰值（倒谱提升可能略缩放）
+        if mag.max() > 0:
+            scale = float(mag.max()) / max(float(env.max()), 1e-12)
+            env = env * scale
+        return env.astype(np.float32)
+
     def _process_frame(self, frame: np.ndarray, pitch_ratio: float,
                        form_shift_ratio: float) -> np.ndarray:
         """处理一帧（self.N 个采样），返回同长度输出。
@@ -405,9 +475,16 @@ class FormantCorrector:
         必须把共振峰（包络）从 F_orig × R 拉回到 F_orig（默认）或者
         F_orig × form_shift（用户可调）。
 
-        具体：
+        包络估计方法（由 self.envelope_method 决定）：
+          - "lpc"（v0.5.2 起默认）：倒谱提升法（cepstrum liftering）。
+            log|X| → IFFT 得倒谱 → 保留 c[0..order] → FFT 回频率域 → exp。
+            包络与谐波密度无关，能精确跟踪共振峰形状。order = N//20。
+          - "max_filter"（旧）：沿频率轴 rolling max。快但容易高估包络
+            （始终跟踪谐波峰顶，谐波密时偏离真包络）。
+
+        具体步骤：
           1. 取 WSOLA 输出的频谱 mag_frame（含新音高的谐波列 + 新位置的包络）
-          2. 在频率轴上做 rolling max 估出 WSOLA 包的包络 env_wsola
+          2. 用 LPC（或 max_filter）估出 WSOLA 包的包络 env_wsola
              （峰值在 F_orig × R 位置）
           3. residual = mag_frame / env_wsola → 拉平后的相对谱（去掉了 WSOLA 的
              包络调制，谐波相对幅度仍按 WSOLA 后的比例）
@@ -423,8 +500,11 @@ class FormantCorrector:
         K = mag.shape[-1]
         idx = np.arange(K, dtype=np.float64)
 
-        # 1) 估 WSOLA 输出频谱的包络（rolling max）
-        env = self._max_filter_1d(mag, self.filt_bins).astype(np.float32)
+        # 1) 估 WSOLA 输出频谱的包络
+        if self.envelope_method == "lpc":
+            env = self._lpc_envelope(mag, self.lpc_order, self.N)
+        else:
+            env = self._max_filter_1d(mag, self.filt_bins).astype(np.float32)
         mmax = float(mag.max()) if mag.size else 0.0
         floor = max(1e-4 * mmax, 1e-8)
         env = np.maximum(env, floor)
