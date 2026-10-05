@@ -43,6 +43,7 @@ models/*.npy
 models/_hubert_dl/           # cached HF/MS model download (huge)
 models/chinese-hubert-base    # symlink to _hubert_dl cache
 models/test_*.wav             # test wav artifacts
+models/voice_demo_*.wav       # voice demo artifacts
 # but keep the README
 !models/README.txt
 !models/*.md

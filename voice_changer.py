@@ -192,6 +192,16 @@ class VoiceChangerApp:
         self._xruns = 0
         self._error = None
 
+        # --- RVC 引擎状态 ---
+        self._mode = "dsp"        # "dsp" 或 "rvc"
+        self._rvc_engine = None
+        self._rvc_key = 12        # 默认升 12 半音（女声角色常用）
+        self._rvc_model_path = os.path.join(HERE, "models", "三月七.pth")
+        self._rvc_hubert_path = os.path.join(HERE, "models", "chinese-hubert-base")
+        self._rvc_context_ms = 500
+        self._rvc_hop_ms = 250
+        self._rvc_f0_method = "autocorr"
+
         self.stream = None
         self.pipeline = None
         self.samplerate = 48000
@@ -256,6 +266,53 @@ class VoiceChangerApp:
                        command=lambda s=semi, f=fs, e=eff, n=name:
                        self.apply_preset(n, s, f, e)
                        ).pack(side="left", padx=2)
+
+        # ---- 模式选择：DSP（传统变声）/ RVC（角色音色推理，CPU 实时）----
+        mode_frame = ttk.LabelFrame(wrap, text=" 模式（v0.7+ 新增 RVC 角色音色） ")
+        mode_frame.pack(fill="x", padx=10, pady=5)
+        self.mode_var = tk.StringVar(value="dsp")
+        ttk.Radiobutton(mode_frame, text="DSP（音调 + 共振峰，传统变声）",
+                        variable=self.mode_var, value="dsp",
+                        command=self.on_mode_change
+                        ).grid(row=0, column=0, sticky="w", padx=8, pady=4)
+        ttk.Radiobutton(mode_frame, text="RVC（角色音色推理，CPU 实时 ≈ 750ms 延迟）",
+                        variable=self.mode_var, value="rvc",
+                        command=self.on_mode_change
+                        ).grid(row=0, column=1, sticky="w", padx=8, pady=4)
+
+        # ---- RVC 子设置 ----
+        self.rvc_frame = ttk.LabelFrame(wrap, text=" RVC 角色音色设置 ")
+        self.rvc_frame.pack(fill="x", padx=10, pady=5)
+
+        ttk.Label(self.rvc_frame, text="模型 (.pth / .onnx)").grid(row=0, column=0, sticky="w", padx=8, pady=4)
+        self.rvc_model_var = tk.StringVar(value=self._rvc_model_path)
+        self.rvc_model_entry = ttk.Entry(self.rvc_frame, textvariable=self.rvc_model_var, width=58)
+        self.rvc_model_entry.grid(row=0, column=1, sticky="we", padx=6, pady=4)
+        ttk.Button(self.rvc_frame, text="…", width=3,
+                   command=self._browse_rvc_model
+                   ).grid(row=0, column=2, padx=4)
+        self.rvc_model_entry.bind("<FocusOut>", lambda e: self._on_rvc_model_change())
+
+        ttk.Label(self.rvc_frame, text="升/降调 (半音)").grid(row=1, column=0, sticky="w", padx=8, pady=4)
+        self.rvc_key_var = tk.IntVar(value=self._rvc_key)
+        ttk.Scale(self.rvc_frame, from_=-12, to=24, variable=self.rvc_key_var, orient="horizontal",
+                  command=self.on_rvc_key).grid(row=1, column=1, sticky="we", padx=6, pady=4)
+        self.rvc_key_label = ttk.Label(self.rvc_frame, text=f"{self._rvc_key:+d} 半音", width=12, anchor="w")
+        self.rvc_key_label.grid(row=1, column=2, padx=6, pady=4)
+
+        ttk.Label(self.rvc_frame, text="F0 提取（autocorr=快, pyin=稳）").grid(row=2, column=0, sticky="w", padx=8, pady=4)
+        self.rvc_f0_var = tk.StringVar(value="autocorr")
+        ttk.Combobox(self.rvc_frame, textvariable=self.rvc_f0_var, state="readonly", width=10,
+                     values=("autocorr", "pyin")).grid(row=2, column=1, sticky="w", padx=6, pady=4)
+        self.rvc_f0_var.trace_add("write", lambda *_: setattr(self, "_rvc_f0_method", self.rvc_f0_var.get()))
+
+        self.rvc_status = ttk.Label(self.rvc_frame, text="引擎未加载",
+                                     foreground="#777", wraplength=560, justify="left")
+        self.rvc_status.grid(row=3, column=0, columnspan=3, sticky="w", padx=8, pady=(0, 6))
+
+        self.rvc_frame.columnconfigure(1, weight=1)
+
+        self.on_mode_change()  # 初始禁用/启用
 
         # 音效 / 音量 / 参数
         fx = ttk.LabelFrame(wrap, text=" 音效 · 音量 · 音质 ")
@@ -393,6 +450,65 @@ class VoiceChangerApp:
         self.on_effect()
         self.status.set(f"已套用预设：{name}（{semi:+.0f} 半音, 共振峰 ×{form_shift:.2f}）")
 
+    # -------------------------------------------------------------- RVC 模式
+    def on_mode_change(self):
+        self._mode = self.mode_var.get()
+        if self._mode == "rvc":
+            # DSP 区暂时禁灰（但保留值，下次切回还能用）
+            for w in (self.semi_var, self.form_var, self.formant_var, self.effect_var):
+                try:
+                    pass  # ttk var 无法直接 disable；用 frame 状态更直观
+                except Exception:
+                    pass
+            self._enable_children(pitch_frame := self._find_label_frame(self.root, " 音调 · 共振峰"),
+                                   False)
+            self._enable_children(self._find_label_frame(self.root, " 音效 · 音量 · 音质 "), False)
+            self.rvc_status.config(text="准备 RVC 引擎（点「开始变声」时加载）",
+                                   foreground="#0aa")
+        else:
+            self._enable_children(self._find_label_frame(self.root, " 音调 · 共振峰"), True)
+            self._enable_children(self._find_label_frame(self.root, " 音效 · 音量 · 音质 "), True)
+            self.rvc_status.config(text="DSP 模式（未使用 RVC）", foreground="#777")
+
+    @staticmethod
+    def _find_label_frame(root, text_startswith):
+        for w in root.winfo_children():
+            for c in w.winfo_children():
+                if isinstance(c, ttk.LabelFrame) and c.cget("text").startswith(text_startswith):
+                    return c
+        return None
+
+    @staticmethod
+    def _enable_children(frame, enabled):
+        if frame is None:
+            return
+        for child in frame.winfo_children():
+            try:
+                if enabled:
+                    child.state(["!disabled"])
+                else:
+                    child.state(["disabled"])
+            except Exception:
+                pass
+
+    def _browse_rvc_model(self):
+        from tkinter import filedialog as fd
+        path = fd.askopenfilename(title="选择 RVC 模型",
+                                   initialdir=os.path.join(HERE, "models"),
+                                   filetypes=[("RVC 模型", "*.pth *.onnx"), ("所有", "*.*")])
+        if path:
+            self.rvc_model_var.set(path)
+            self._on_rvc_model_change()
+
+    def _on_rvc_model_change(self):
+        self._rvc_model_path = self.rvc_model_var.get().strip()
+
+    def on_rvc_key(self, _=None):
+        self._rvc_key = int(self.rvc_key_var.get())
+        self.rvc_key_label.config(text=f"{self._rvc_key:+d} 半音")
+        if self._rvc_engine is not None:
+            self._rvc_engine.set_f0_up_key(self._rvc_key)
+
     # -------------------------------------------------------------- 启停
     def toggle(self):
         if self.stream is not None:
@@ -412,6 +528,36 @@ class VoiceChangerApp:
 
         self.blocksize = int(self.block_var.get())
         wanted_sr = int(self.sr_var.get())
+
+        # === RVC 模式：先把引擎加载好，再开流 ===
+        if self._mode == "rvc":
+            self.status.set("正在加载 RVC 引擎（首次约需 5-10 秒）...")
+            self.root.update_idletasks()
+            try:
+                from rvc_realtime import RealtimeRVC
+                self._rvc_engine = RealtimeRVC(
+                    pth_path=self._rvc_model_path,
+                    hubert_path=self._rvc_hubert_path,
+                    device_sr=wanted_sr,
+                    context_ms=self._rvc_context_ms,
+                    hop_ms=self._rvc_hop_ms,
+                    f0_up_key=self._rvc_key,
+                )
+                self._rvc_engine.f0_method = self._rvc_f0_method
+                self._rvc_engine.start()
+                self.rvc_status.config(
+                    text=f"引擎已就绪｜{os.path.basename(self._rvc_model_path)}｜"
+                         f"{self._rvc_key:+d} 半音｜f0={self._rvc_f0_method}",
+                    foreground="#0a6")
+            except Exception as exc:
+                self.rvc_status.config(text=f"❌ RVC 引擎加载失败：{exc}", foreground="#c33")
+                self._rvc_engine = None
+                messagebox.showerror("RVC 加载失败", f"{exc}\n\n回退到 DSP 模式。")
+                self.mode_var.set("dsp")
+                self.on_mode_change()
+                # 不开流，让用户修正后再试
+                return
+
         candidates_sr = [wanted_sr] + [s for s in (48000, 44100) if s != wanted_sr]
         try:
             default_sr = int(float(sd.query_devices(out_idx)["default_samplerate"]))
@@ -461,12 +607,23 @@ class VoiceChangerApp:
                 self._xruns = 0
                 self._rec_blocks = []
                 self._rec_samples = 0
-                latency_ms = (pipeline.latency_samples + 2 * self.blocksize) / sr * 1000.0
-                self.start_btn.config(text="■ 停止")
-                self.status.set(f"运行中：{sr} Hz ｜ 块 {self.blocksize} ｜ 声道 {chans} ｜ "
-                                f"算法延迟 ≈ {latency_ms:.0f} ms"
-                                f"（叠加系统缓冲通常再多 20~40 ms）{note}")
+                if self._mode == "rvc" and self._rvc_engine is not None:
+                    total_lat = self._rvc_engine.latency_ms
+                    self.start_btn.config(text="■ 停止")
+                    self.status.set(
+                        f"RVC 模式运行中：{sr} Hz ｜ 块 {self.blocksize} ｜ 角色 {os.path.basename(self._rvc_model_path)} ｜ "
+                        f"延迟 ≈ {total_lat:.0f} ms (cpu 实时){note}")
+                else:
+                    latency_ms = (pipeline.latency_samples + 2 * self.blocksize) / sr * 1000.0
+                    self.start_btn.config(text="■ 停止")
+                    self.status.set(f"运行中：{sr} Hz ｜ 块 {self.blocksize} ｜ 声道 {chans} ｜ "
+                                    f"算法延迟 ≈ {latency_ms:.0f} ms"
+                                    f"（叠加系统缓冲通常再多 20~40 ms）{note}")
                 return
+        # 走到这里说明开流全失败
+        if self._rvc_engine is not None:
+            self._rvc_engine.stop()
+            self._rvc_engine = None
         self.pipeline = self.stream = None
         messagebox.showerror(
             "打不开音频流",
@@ -486,6 +643,12 @@ class VoiceChangerApp:
             except Exception:
                 pass
         self.stream = None
+        if self._rvc_engine is not None:
+            try:
+                self._rvc_engine.stop()
+            except Exception:
+                pass
+            self._rvc_engine = None
         self._rec_on = False
         if self.recording:
             self.recording = False
@@ -511,7 +674,25 @@ class VoiceChangerApp:
             if status:
                 self._xruns += 1
             x = indata.mean(axis=1) if indata.ndim > 1 else indata
-            # 共振峰开关切换会让现有 pipeline 失效：就地重建一次
+
+            # === RVC 路径：把块推进引擎，从输出环里取 ===
+            if self._mode == "rvc" and self._rvc_engine is not None:
+                self._rvc_engine.push(x)
+                y = self._rvc_engine.pull(len(x))
+                if y.size < len(x):
+                    y = np.concatenate([y, np.zeros(len(x) - y.size, dtype=np.float32)])
+                elif y.size > len(x):
+                    y = y[:len(x)]
+                self._level = float(np.sqrt(np.mean(y * y))) if y.size else 0.0
+                self._peak = float(np.max(np.abs(y))) if y.size else 0.0
+                if self._rec_on:
+                    self._rec_blocks.append(y.copy())
+                    self._rec_samples += y.size
+                    if self._rec_samples > MAX_RECORD_SECONDS * self.samplerate:
+                        self._rec_on = False
+                return y
+
+            # === DSP 路径：原 pipeline.process ===
             if self.pipeline is None and self.stream is not None:
                 self.pipeline = vc.VoicePipeline(self.samplerate, self.blocksize,
                                                  formant_correct=self._formant_on,
