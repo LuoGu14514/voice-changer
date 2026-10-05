@@ -20,7 +20,7 @@ requirements.txt   numpy / sounddevice / soundfile
 3. **输出到**：想自己听效果就选耳机/扬声器；想给游戏、QQ、微信用就选 `CABLE Input`（见第三节）。
 4. 点 **▶ 开始变声**，然后说话。想听效果可以戴耳机，避免麦克风把扬声器的声音收进去产生啸叫。
 5. **音调**滑块拖到 ±12 半音；**共振峰位移**滑块（0.70~1.30）拖到想要的位置；或直接点预设按钮：
-   原声 / 真女声 / 真男声 / 萝莉 / 大叔 / 机器人 / 回声 / 电话音。
+   **30 个内置预设**（详见下方「预设一览」）。
 6. 「**启用共振峰校正**」勾上后，升/降调会自动把共振峰拉回原位 ——「男声 +3 半音」听感上
    是「还是男声、但变年轻了」，而不是「变成小孩音」。
 7. **开始录音** → 说话 → **保存录音…** 可以导出变声后的 wav。
@@ -77,6 +77,49 @@ requirements.txt   numpy / sounddevice / soundfile
 | 自己听到自己延迟很大 | 用有线耳机，别用蓝牙；块大小调小到 256 |
 
 声音处理全部在本机完成，不联网、不录音上传。
+
+## 预设一览（v0.3.0 起共 30 项）
+
+按分组显示，每项写明半音数和共振峰位移比。**共振峰位移比 >1** = 嘴更小（女声/儿童），**<1** = 嘴更大（男声/大叔）。
+
+| 分组 | 预设 | 半音 | 共振峰 | 音效 | 参考 |
+|---|---|---:|---:|---|---|
+| 原声 | 原声 | 0 | 1.00 | 无 | — |
+| 女性 | 真女声 | +3 | 1.05 | 无 | — |
+|  | 御姐 | +4 | 1.10 | 无 | MaidMic |
+|  | 萌妹 | +6 | 1.18 | 无 | 自调 |
+|  | 嗲嗲 | +5 | 1.20 | 无 | MaidMic |
+|  | 客服女 | +2 | 1.05 | 无 | — |
+|  | 播音女 | +1 | 1.02 | 无 | — |
+|  | 少妇 | +2 | 0.96 | 无 | — |
+|  | 老奶奶 | −6 | 0.88 | 无 | — |
+| 男性 | 真男声 | −3 | 0.95 | 无 | — |
+|  | 大叔 | −5 | 0.90 | 无 | MaidMic deep_uncle |
+|  | 恶魔 | −6 | 0.85 | 无 | lyrebird Darth Vader |
+|  | 磁性男 | −2 | 0.92 | 无 | — |
+|  | 客服男 | −1 | 0.95 | 无 | — |
+|  | 播音男 | 0 | 0.97 | 无 | — |
+|  | 老人 | −7 | 0.85 | 无 | — |
+| 童声 | 萝莉 | +7 | 1.18 | 无 | MaidMic chipmunk |
+|  | 正太 | +5 | 1.10 | 无 | — |
+|  | 小孩 | +9 | 1.20 | 无 | — |
+|  | 娃娃音 | +12 | 1.20 | 无 | neboyang ROSE +12.8 |
+|  | 小猫 | +4 | 1.15 | 无 | neboyang KITTY |
+|  | 花栗鼠 | +7 | 1.20 | 无 | MaidMic chipmunk |
+|  | 汤姆猫 | +10 | 1.18 | 无 | neboyang TOM |
+| 特效 | 机器人 | 0 | 1.00 | robot | — |
+|  | 电音女王 | +4 | 1.10 | robot | — |
+|  | 外星人 | +2 | 1.10 | robot | SUONSUN9527 alien |
+|  | 兽人 | −5 | 0.85 | echo | SUONSUN9527 orc |
+|  | 幽灵 | −2 | 0.95 | echo | SUONSUN9527 ghost |
+|  | 回声 | 0 | 1.00 | echo | — |
+|  | 电话音 | 0 | 1.00 | phone | — |
+
+**参考来源**（数据来自 GitHub 公开项目；本项目只 port 数值表，不复制源码）：
+- [suer781/MaidMic](https://github.com/suer781/MaidMic) — 萝莉/大叔/花栗鼠（Apache-2.0）
+- [neboyang/VoiceChanger](https://github.com/neboyang/VoiceChanger) — KITTY/ROSE/WOMAN/UNCLE/MAN/TOM（Apache-2.0）
+- [lyrebird-voice-changer/lyrebird](https://github.com/lyrebird-voice-changer/lyrebird) — Darth Vader 等行业基线
+- [SUONSUN9527/windows-voice-changer](https://github.com/SUONSUN9527/windows-voice-changer) — 兽人/幽灵/外星人
 
 ## 五、自测
 

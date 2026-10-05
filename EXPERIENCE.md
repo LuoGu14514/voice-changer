@@ -1,4 +1,4 @@
-# EXPÉRIENCE — 实时变声器 v0.2 的算法研判
+# EXPÉRIENCE — 实时变声器 v0.3 的算法研判 + 同类项目预设库
 
 把 v0.1「只能升降调」升级到 v0.2「更像真人女声/男声」时，我系统地看了 GitHub 上的同类项目，
 本文是这份调研的结论 + 落地路径说明。配合 `voice_core.py` 里的注释一起看最清楚。
@@ -107,8 +107,44 @@ y = irfft(new_mag * exp(j*phase))
 
 ---
 
-## 6. 还可以做（v0.3+ 候选）
+## 6. v0.3：扩到 30 个音色预设（用户实测反馈 v0.2 不够"像真人女声"）
+
+v0.2 上线后用户听了反馈：「升调后的声音和真实女声有很大差距」。我先扩预设数量（v0.2 才 8 个，类别不全），
+再去 GitHub 找业内已有 preset 库对一下参数。
+
+### 6.1 第二轮调研（preset 数据 / 算法库）
+
+| 项目 | ★ | 贡献 | License |
+|------|---|------|---------|
+| [neboyang/VoiceChanger](https://github.com/neboyang/VoiceChanger) | — | 7 个 pitch+tempo+rate preset（KITTY +4/1.02/1.2 / ROSE +12.8 / WOMAN +7 / UNCLE -3.9 / MAN -7 / TOM +10） | Apache-2.0 |
+| [suer781/MaidMic](https://github.com/suer781/MaidMic) | — | 5 个 + 3 Lua 插件，**唯一带 formant_shift 独立参数的库**（萝莉 +4/+2 / 大叔 -5/-3 / 花栗鼠 +7/+3 / 电话音 bass-10/treble+6/dist0.15） | Apache-2.0 |
+| [lyrebird-voice-changer/lyrebird](https://github.com/lyrebird-voice-changer/lyrebird) | 1859 | industry baseline pitch 表（Woman +2.5 / Girl +2.8 / Darth Vader -6） | GPL-3.0（数据参考，不复用源码） |
+| [SUONSUN9527/windows-voice-changer](https://github.com/SUONSUN9527/windows-voice-changer) | 1 | community.json 5 个角色（goblin/orc/alien/community-robot/ghost），多声部 + reverb + ring mod 配方 | MIT/CC |
+| [schrmh/voicechanger-tui](https://github.com/schrmh/voicechanger-tui) | 15 | 3 个 sox-cents preset（child +700 / young adult -200 / old man -500） | — |
+
+参数映射：
+- MaidMic `formant_shift` 用「半音绝对值」：±3 ≈ 我 ±0.10 的 ratio（萝莉 1.10 / 大叔 0.88）。
+- lyrebird `pitch_value × 1.6 ≈ 半音`（粗略参考）。
+- neboyang 没有 form_shift；按 character 名字 + MaidMic 类比选值。
+
+合并到 v0.3 VOICE_PRESETS 的具体归因（README 也有同样表格）：
+- 御姐 = MaidMic / 大叔 = MaidMic deep_uncle / 恶魔 = lyrebird Darth Vader
+- 萝莉 / 花栗鼠 = MaidMic chipmunk / 娃娃音 = neboyang ROSE / 小猫 = neboyang KITTY / 汤姆猫 = neboyang TOM
+- 外星人 / 兽人 / 幽灵 = SUONSUN9527 community.json
+- 其他（真女声/萌妹/老奶奶/正太 等） = 自调
+
+### 6.2 还做了
+
+- GUI 预设按钮改按「原/女/男/童/特效」分组显示
+- 新增「我的预设」区：可保存当前参数为 JSON、调 `.electron()`、从磁盘加载、删除（存到 `%APPDATA%/voice-changer/user_presets.json`）
+- 测试 46 → **63 项**（30 个预设每个都跑过 process_offline；每个都不爆音、不出 NaN）
+
+---
+
+## 7. 还可以做（v0.4+ 候选）
 
 - 用 LPC（线性预测）估包络代替 rolling max —— pprablanc 的半成品仓库
 - 让 form_shift_ratio 跟着 semitones 自动适配（默认 +3 半音就配 +1.05 form_shift）
+- 给 VOICE_PRESETS 每项带附加音效配方（per-preset echo_ms delay 40ms/350ms、tremolo、vibrato、reverb）
+  —— 当前 EffectChain 只有 echo_ms=130 默认、phone、robot 三种，要支持 SUONSUN9527 的多参音效需要先扩 EffectChain
 - 实时声码器跑 RVC 轻量版（如果用户能提供目标音色录音）

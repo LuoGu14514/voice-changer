@@ -276,7 +276,7 @@ def test_voice_presets_callable():
     """
     x = vowel_like(f0=180.0, formants=(500.0, 1500.0, 2500.0), dur=0.6)
     in_peak = float(np.max(np.abs(x)))
-    for name, semi, fs, eff in vc.VOICE_PRESETS:
+    for name, semi, fs, eff, _grp in vc.VOICE_PRESETS:
         y = vc.process_offline(x, SR, semitones=semi, form_shift_ratio=fs,
                                 effect=eff, formant_correct=True)
         peak = float(np.max(np.abs(y)))
