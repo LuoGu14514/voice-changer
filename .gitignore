@@ -40,6 +40,9 @@ models/*.pth
 models/*.pt
 models/*.index
 models/*.npy
+models/_hubert_dl/           # cached HF/MS model download (huge)
+models/chinese-hubert-base    # symlink to _hubert_dl cache
+models/test_*.wav             # test wav artifacts
 # but keep the README
 !models/README.txt
 !models/*.md

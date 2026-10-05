@@ -1,196 +1,303 @@
-"""RVC 文件变声推理（极简版，CPU 跑）。
+"""RVC inference engine for voice conversion.
 
-使用：
-    python rvc_infer.py --input in.wav --output out.wav --model models/some.pth
-
-特性：
-    - 接受 RVC v2 .pth 模型（HuBERT + Generator）
-    - 接受 ONNX 导出的 .onnx 模型（仅 Generator，HuBERT 仍用 .pth）
-    - 自动检测模型类型
-    - 流式 / 整段两种处理模式
-
-依赖：
-    pip install torch onnxruntime soundfile numpy
-    （可选：pip install transformers  -- for HuBERT feature extractor）
-
-注意：
-    - 完整 RVC 推理需要 HuBERT 特征提取器（chinese-hubert-base，~360MB），
-      推荐先用 [content-free Hubert] 或 [rmvpe] 做F0 估计
-    - 本脚本默认提供 demo 级别的"模型占位 + F0+Hubert 提取"，具体声学模型由
-      LoadingWaveRNN / RVC 提供的 Generator 实现
+End-to-end pipeline: wav → HuBERT features → F0 → RVC model → output wav.
+Uses the official RVC-Project code from rvc_lib/ for the model architecture.
 """
 from __future__ import annotations
 
-import json
 import os
 import sys
-import time
-from pathlib import Path
-from typing import Optional, Tuple
-
+import json
+import logging
 import numpy as np
-import soundfile as sf
+import torch
+from pathlib import Path
+
+# Make rvc_lib importable
+_HERE = Path(__file__).resolve().parent
+RVC_LIB = _HERE / "rvc_lib"
+if str(RVC_LIB) not in sys.path:
+    sys.path.insert(0, str(RVC_LIB))
+
+logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+log = logging.getLogger("rvc_infer")
 
 
-class RVCModel:
-    """RVC 模型加载器。支持：
-       - RVC v2 .pth (state dict)
-       - ONNX .onnx (仅声学模型，HuBERT 仍需 pth)
+# ---------------------------------------------------------------------------
+# F0 extraction (lightweight CPU-only — no parselmouth/rmvpe needed)
+# ---------------------------------------------------------------------------
+
+def extract_f0_pyin(wav: np.ndarray, sr: int, frame_period_ms: float = 10.0) -> np.ndarray:
+    """Extract F0 contour using librosa.pyin.
+
+    Returns 1-D numpy array of F0 in Hz, with `0` for unvoiced frames.
+    Length matches HuBERT feature frames at `frame_period_ms` resolution.
     """
-
-    def __init__(self, model_path: str | os.PathLike, index_path: Optional[str] = None,
-                 device: str = "cpu"):
-        self.model_path = str(model_path)
-        self.index_path = str(index_path) if index_path else None
-        self.device = device
-        self.model_type: str = "unknown"  # 'pth' / 'onnx'
-        self.config_path = Path(self.model_path).with_suffix(".json")
-        self.config: dict = {}
-        self.model = None  # 占位：声学模型 / 或 ONNX session
-
-    def load(self):
-        ext = Path(self.model_path).suffix.lower()
-        if ext == ".onnx":
-            self.model_type = "onnx"
-            import onnxruntime as ort
-            so = ort.SessionOptions()
-            so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-            self.model = ort.InferenceSession(self.model_path, sess_options=so,
-                                              providers=["CPUExecutionProvider"])
-            print(f"  [RVC] ONNX model loaded: {self.model_path}")
-            print(f"  [RVC] Inputs: {[i.name for i in self.model.get_inputs()]}")
-            print(f"  [RVC] Outputs: {[o.name for o in self.model.get_outputs()]}")
-        elif ext in (".pth", ".pt"):
-            self.model_type = "pth"
-            # 完整加载需要 torch + fairseq；留个坑
-            print(f"  [RVC] Detected PyTorch checkpoint: {self.model_path}")
-            print(f"  [RVC] For full load: install torch>=2.0 and run with --torch flag")
-        else:
-            raise ValueError(f"Unknown model extension: {ext}")
-
-        # 加载配置文件
-        if self.config_path.exists():
-            with open(self.config_path, encoding="utf-8") as f:
-                self.config = json.load(f)
-                print(f"  [RVC] Config: {self.config}")
-        return self
-
-    def infer(self, hubert: np.ndarray, f0: np.ndarray,
-              protect: float = 0.5) -> np.ndarray:
-        """推理一次：输入 HuBERT 特征 [T, 768] 与 F0 [T]，输出 wav [T*256]。
-
-        注意：这是 RVC v2 接口；具体 shape 取決于模型。
-        """
-        if self.model_type != "onnx":
-            raise NotImplementedError("Only ONNX inference is implemented in this skeleton.")
-        # 典型 RVC v2 ONNX 输入: hubert[T, 768], f0[T, 1], protect[T, 1]
-        hubert = hubert.astype(np.float32)
-        f0 = f0.astype(np.float32).reshape(-1, 1)
-        protect = np.full((hubert.shape[0], 1), float(protect), dtype=np.float32)
-        outputs = self.model.run(None, {"hubert": hubert, "f0": f0, "protect": protect})
-        return outputs[0].squeeze().astype(np.float32)
+    import librosa
+    hop = int(sr * frame_period_ms / 1000)
+    f0, voiced_flag, voiced_prob = librosa.pyin(
+        wav.astype(np.float32),
+        fmin=50,
+        fmax=1100,
+        sr=sr,
+        frame_length=2048,
+        hop_length=hop,
+        fill_na=0.0,
+    )
+    # f0 with NaN for unvoiced; replace with 0
+    f0 = np.nan_to_num(f0, nan=0.0)
+    return f0.astype(np.float32)
 
 
-def f0_extract_cheap(y: np.ndarray, sr: int, hop: int = 160) -> np.ndarray:
-    """极简 F0 估计：仅用于在没有 torch/rmvpe 时检验流水线。
-
-    使用 numpy 自相关的简化版本，只适合跟踪基频大致变化，不是商用 F0。
-    输出 [T]，T = len(y) // hop。
-    """
-    if y.ndim > 1:
-        y = y.mean(axis=1)
-    n_frames = len(y) // hop
+def extract_f0_autocorr(wav: np.ndarray, sr: int, frame_period_ms: float = 10.0) -> np.ndarray:
+    """Cheap autocorrelation F0 extractor (fallback if pyin too slow)."""
+    import scipy.signal as sp
+    hop = int(sr * frame_period_ms / 1000)
+    # Pre-emphasize
+    emphasized = np.append(wav[0], wav[1:] - 0.97 * wav[:-1])
+    n_frames = 1 + (len(emphasized) - 1024) // hop
     f0 = np.zeros(n_frames, dtype=np.float32)
+    win = np.hanning(1024)
+    lag_min = int(sr / 1100)  # 1100 Hz
+    lag_max = int(sr / 50)    # 50 Hz
     for i in range(n_frames):
-        start = i * hop
-        frame = y[start:start + 1024]
-        if len(frame) < 1024:
-            break
-        # 归一化自相关，找最大 lag（在 [50, 500] Hz 对应 sr 中）
-        frame = frame - frame.mean()
-        e = np.dot(frame, frame)
-        if e < 1e-6:
+        s = emphasized[i * hop : i * hop + 1024] * win
+        if np.max(np.abs(s)) < 0.005:  # silent frame
             continue
-        lo_lag = max(2, int(sr / 500))  # 500 Hz
-        hi_lag = min(len(frame) // 2, int(sr / 50))  # 50 Hz
-        if hi_lag <= lo_lag:
-            continue
-        ac = np.array([np.dot(frame[:len(frame)-lag], frame[lag:]) / e
-                       for lag in range(lo_lag, hi_lag)])
-        peak = int(np.argmax(ac))
-        f0[i] = sr / (peak + lo_lag)
+        ac = np.correlate(s, s, mode="full")[1024:]  # auto correlations [0..inf]
+        # find first peak in [lag_min..lag_max]
+        peak_idx = lag_min + np.argmax(ac[lag_min:lag_max])
+        if peak_idx > 0 and ac[peak_idx] > 0.3 * ac[0]:
+            f0[i] = sr / peak_idx
     return f0
 
 
-def hubert_dummy(features_required: int = 768) -> np.ndarray:
-    """极简 HuBERT 占位。"""
-    # 实际上需要 transformers + chinese-hubert-base
-    # 这里仅返回占位 0，让流水线走到 ONNX；输出会有结果但不真实
-    return np.zeros((1, features_required), dtype=np.float32)
+# ---------------------------------------------------------------------------
+# HuBERT feature extraction (uses official RVC infer.hubert code)
+# ---------------------------------------------------------------------------
+
+class HuBERTExtractor:
+    def __init__(self, model_path: str, device: str = "cpu"):
+        from transformers import AutoFeatureExtractor, HubertModel
+        self.device = device
+        log.info(f"Loading HuBERT from {model_path}")
+        self.feature_extractor = AutoFeatureExtractor.from_pretrained(model_path)
+        self.model = HubertModel.from_pretrained(model_path).to(device)
+        self.model.eval()
+
+    def extract(self, wav_16k: np.ndarray) -> np.ndarray:
+        """Extract HuBERT features from 16kHz mono wav.
+
+        Returns numpy array [T, 768].
+        """
+        inputs = self.feature_extractor(
+            wav_16k.astype(np.float32),
+            sampling_rate=16000,
+            return_tensors="pt",
+            return_attention_mask=True,
+        )
+        input_values = inputs.input_values.to(self.device)
+        attention_mask = inputs.attention_mask.to(self.device)
+        with torch.no_grad():
+            outputs = self.model(input_values, attention_mask=attention_mask)
+            feats = outputs.last_hidden_state[0]  # [T, 768]
+        return feats.cpu().numpy().astype(np.float32)
 
 
-def convert_file(input_path: str, output_path: str, model_path: str,
-                 index_path: Optional[str] = None, sr: int = 40000):
-    """文件变声主入口。"""
-    print(f"  [RVC] Input: {input_path}")
-    print(f"  [RVC] Output: {output_path}")
-    print(f"  [RVC] Model: {model_path}")
+# ---------------------------------------------------------------------------
+# RVC Model wrapper
+# ---------------------------------------------------------------------------
 
-    # 1. 读 wav
-    y, file_sr = sf.read(input_path, dtype="float32")
-    if y.ndim > 1:
-        y = y.mean(axis=1)
-    print(f"  [RVC] Wav: sr={file_sr}, duration={len(y)/sr:.2f}s")
+class RVCModel:
+    """Loads a .pth RVC model and provides conversion API."""
 
-    # 2. 加载模型
-    rvc = RVCModel(model_path, index_path).load()
+    def __init__(self, pth_path: str, device: str = "cpu"):
+        from infer.module.models import (
+            SynthesizerTrnMs256NSFsid,
+            SynthesizerTrnMs768NSFsid,
+        )
 
-    # 3. 提取特征（占位——真实场景需要 torch + chinese-hubert）
-    if rvc.model_type == "onnx":
-        n_frames = max(1, len(y) // 160)
-        hubert = np.zeros((n_frames, 768), dtype=np.float32)
-        f0 = f0_extract_cheap(y, file_sr, hop=160)
-        print(f"  [RVC] Frames: {n_frames}, F0 range: {f0[f0>0].min() if (f0>0).any() else 0:.1f} - {f0.max():.1f} Hz")
+        log.info(f"Loading RVC .pth from {pth_path}")
+        ckpt = torch.load(pth_path, map_location="cpu", weights_only=False)
+        self.sr_str = ckpt.get("sr", "48k")
+        self.f0 = ckpt.get("f0", 1)
+        self.info = ckpt.get("info", "")
+        self.spk_id = 0  # single speaker model
 
-        # 4. 推理
-        t0 = time.time()
-        try:
-            out = rvc.infer(hubert, f0, protect=0.5)
-        except Exception as e:
-            print(f"  [RVC] ONNX inference failed: {e}")
-            print(f"  [RVC] This usually happens because the dummy features don't match the model's training distribution.")
-            print(f"  [RVC] Real inference needs proper HuBERT + F0 extractor.")
-            return None
-        dt = time.time() - t0
-        print(f"  [RVC] Inference: {dt:.2f}s ({len(y)/file_sr/dt:.2f}x realtime on CPU)")
+        sr2sr = {"32k": 32000, "40k": 40000, "48k": 48000}
+        self.sr = sr2sr.get(self.sr_str, 48000)
 
-        # 5. 写 wav
-        sf.write(output_path, out, sr)
-        print(f"  [RVC] Saved: {output_path}, peak={np.max(np.abs(out)):.3f}")
-        return out
-    else:
-        print(f"  [RVC] .pth loading not yet implemented.")
-        return None
+        cfg = list(ckpt["config"])
+        # If config[16] is gin_channels; we use Ms768 since model expected 768 dim emb_phone
+        cfg[17] = sr2sr.get(cfg[17], cfg[17]) if isinstance(cfg[17], str) else cfg[17]
+
+        # Detect 768 vs 256: the checkpoint's emb_phone weight tells us
+        # Just always try Ms768 first; if shape mismatch fall back to Ms256
+        sd = ckpt["weight"]
+        # Find emb_phone shape
+        emb_shape = None
+        for k, v in sd.items():
+            if k.endswith("enc_p.emb_phone.weight"):
+                emb_shape = tuple(v.shape)
+                break
+        if emb_shape is None:
+            raise RuntimeError("Checkpoint missing enc_p.emb_phone.weight")
+
+        log.info(f"  emb_phone shape: {emb_shape} → "
+                 f"{'768-dim' if emb_shape[1] == 768 else '256-dim'}")
+        ModelCls = SynthesizerTrnMs768NSFsid if emb_shape[1] == 768 else SynthesizerTrnMs256NSFsid
+
+        self.model = ModelCls(*cfg[:17], cfg[17], is_half=False)
+        self.model.eval()
+
+        missing, unexpected = self.model.load_state_dict(sd, strict=False)
+        if missing:
+            log.warning(f"  {len(missing)} missing keys (expected for enc_q): "
+                        f"{[k for k in missing if 'enc_q' not in k][:5]}")
+        if unexpected:
+            log.warning(f"  {len(unexpected)} unexpected keys: {unexpected[:5]}")
+
+        self.device = device
+        self.model = self.model.to(device)
+        log.info(f"  ✓ Loaded RVC {self.sr_str} model ({self.info}) on {device}")
+
+    @torch.no_grad()
+    def convert(
+        self,
+        phone_features: np.ndarray,
+        pitch: np.ndarray,
+        f0_up_key: float = 0.0,
+        sid: int = 0,
+        return_length2: int = None,
+    ) -> np.ndarray:
+        """Run inference.
+
+        Args:
+            phone_features: [T, 768] HuBERT features
+            pitch: [F0_frames] F0 in Hz (unvoiced = 0); will be aligned to phone_features T
+            f0_up_key: semitones to shift F0 (positive = higher)
+            sid: speaker id
+        """
+        # Resample F0 to phone-feature length if needed
+        T = phone_features.shape[0]
+        if len(pitch) != T:
+            pitch = np.interp(
+                np.linspace(0, 1, T),
+                np.linspace(0, 1, len(pitch)),
+                pitch,
+            ).astype(np.float32)
+
+        # Apply f0 shift
+        if f0_up_key != 0:
+            shift = 2 ** (f0_up_key / 12)
+            pitch = pitch * shift
+
+        # Convert F0 to coarse pitch (1 unit = 1/256 octave in log domain)
+        # 256 bins cover ~12 semitones × ~21 semitones
+        pitchf = np.zeros_like(pitch, dtype=np.float32)
+        voiced = pitch > 0
+        # RVC uses: coarse = (f0 / 20).log() mapped to 0..255
+        # In their hubert.py they compute: coarse = f0_to_coarse(f0)
+        # f0_to_coarse(f0) = (f0 - 20) mapped log to 256 bins
+        # Actually it's: 255 * (log(f0) - log(20)) / (log(1100) - log(20))
+        pitch_coarse = np.zeros_like(pitch, dtype=np.long)
+        LOG20 = np.log(20.0)
+        LOG1100 = np.log(1100.0)
+        pitch_coarse[voiced] = np.clip(
+            ((np.log(pitch[voiced]) - LOG20) / (LOG1100 - LOG20) * 255).astype(np.long),
+            0, 255,
+        )
+
+        # To torch
+        phone_t = torch.from_numpy(phone_features).unsqueeze(0).float().to(self.device)  # [1, T, 768]
+        phone_lengths = torch.tensor([T], dtype=torch.long).to(self.device)
+        pitch_t = torch.from_numpy(pitch_coarse).unsqueeze(0).long().to(self.device)  # [1, T]
+        pitchf_t = torch.from_numpy(pitchf).unsqueeze(0).to(self.device)  # [1, T]
+        sid_t = torch.tensor([sid], dtype=torch.long).to(self.device)
+
+        out, _, _ = self.model.infer(
+            phone_t,
+            phone_lengths,
+            pitch_t,
+            pitchf_t,
+            sid_t,
+            return_length2=return_length2,
+        )
+        return out[0, 0].cpu().numpy()  # [samples]
+
+
+# ---------------------------------------------------------------------------
+# High-level convert_file API
+# ---------------------------------------------------------------------------
+
+def load_wav_16k(path: str, target_sr: int = 16000) -> np.ndarray:
+    """Load wav file, convert to mono float32, resample to target_sr."""
+    import librosa
+    wav, sr = librosa.load(path, sr=target_sr, mono=True)
+    return wav.astype(np.float32)
+
+
+def convert_file(
+    input_path: str,
+    output_path: str,
+    pth_path: str,
+    hubert_path: str,
+    f0_up_key: float = 0.0,
+    sid: int = 0,
+    device: str = "cpu",
+):
+    """Convert a single audio file end-to-end.
+
+    Args:
+        input_path: source wav (any sr)
+        output_path: where to save converted wav
+        pth_path: RVC .pth file
+        hubert_path: chinese-hubert-base directory
+        f0_up_key: semitones to shift (+12 = one octave up)
+        sid: speaker id (single-speaker models = 0)
+        device: 'cpu' or 'cuda'
+    """
+    import soundfile as sf
+
+    log.info(f"[1/4] Load wav: {input_path}")
+    wav = load_wav_16k(input_path, target_sr=16000)
+    log.info(f"      Loaded {len(wav)/16000:.2f}s @ 16kHz")
+
+    log.info(f"[2/4] HuBERT features")
+    hubert = HuBERTExtractor(hubert_path, device=device)
+    feats = hubert.extract(wav)
+    log.info(f"      Features: {feats.shape}")
+
+    log.info(f"[3/4] F0 extraction (pyin)")
+    f0 = extract_f0_pyin(wav, sr=16000, frame_period_ms=20.0)
+    # HuBERT features at ~50fps; pyin at 50fps (20ms hop) -> same rate
+    log.info(f"      F0 frames: {len(f0)}, voiced: {(f0 > 0).sum()}")
+
+    log.info(f"[4/4] RVC inference")
+    rvc = RVCModel(pth_path, device=device)
+    out_wav = rvc.convert(feats, f0, f0_up_key=f0_up_key, sid=sid)
+    log.info(f"      Output: {len(out_wav)/rvc.sr:.2f}s @ {rvc.sr}Hz, "
+             f"peak={np.abs(out_wav).max():.3f}")
+
+    log.info(f"Save → {output_path}")
+    sf.write(output_path, out_wav, rvc.sr)
+    log.info(f"  ✓ Done")
 
 
 if __name__ == "__main__":
     import argparse
-
-    ap = argparse.ArgumentParser(description="RVC 文件变声")
-    ap.add_argument("--input", "-i", required=True, help="输入 wav")
-    ap.add_argument("--output", "-o", required=True, help="输出 wav")
-    ap.add_argument("--model", "-m", required=True, help="RVC 模型 .pth 或 .onnx")
-    ap.add_argument("--index", default=None, help="RVC .index 文件（可选）")
-    ap.add_argument("--sr", type=int, default=40000, help="输出采样率（默认 40k RVC 标配）")
+    ap = argparse.ArgumentParser(description="RVC voice conversion")
+    ap.add_argument("-i", "--input", required=True, help="input wav")
+    ap.add_argument("-o", "--output", required=True, help="output wav")
+    ap.add_argument("-m", "--model", default="models/三月七.pth")
+    ap.add_argument("--hubert", default="models/chinese-hubert-base")
+    ap.add_argument("--key", type=float, default=0.0, help="f0 shift semitones")
+    ap.add_argument("--sid", type=int, default=0)
     args = ap.parse_args()
 
-    if not Path(args.input).exists():
-        print(f"ERROR: 输入文件不存在 {args.input}")
-        sys.exit(1)
-    if not Path(args.model).exists():
-        print(f"ERROR: 模型不存在 {args.model}")
-        sys.exit(1)
-
-    result = convert_file(args.input, args.output, args.model, args.index, args.sr)
-    if result is None:
-        sys.exit(2)
+    convert_file(
+        args.input, args.output,
+        args.model, args.hubert,
+        f0_up_key=args.key,
+        sid=args.sid,
+    )
