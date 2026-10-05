@@ -792,6 +792,160 @@ def test_formant_corrector_lpc_does_not_crash_pipeline():
           f"rms_in={rms(y):.3f} rms_out={rms(y2):.3f}")
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# v0.5.3 Phase D — pitch envelope smoothing + 随机相位去梳状伪影
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_ratio_smoothing_basic():
+    """ratio_smoothing_blocks=1（默认）应与 v0.5.2 完全一致；=5 时单次调用应仍能产生输出。"""
+    y = vowel_like(f0=180.0, formants=(500.0, 1500.0, 2500.0), dur=0.6)
+    y1 = vc.process_offline(y, SR, semitones=3.0, ratio_smoothing_blocks=1)
+    y5 = vc.process_offline(y, SR, semitones=3.0, ratio_smoothing_blocks=5)
+    check("ratio_smoothing_blocks=1 输出有限",
+          bool(np.all(np.isfinite(y1))) and rms(y1) > 0,
+          f"rms={rms(y1):.3f}")
+    check("ratio_smoothing_blocks=5 输出有限",
+          bool(np.all(np.isfinite(y5))) and rms(y5) > 0,
+          f"rms={rms(y5):.3f}")
+
+
+def test_ratio_smoothing_smoothes_transitions():
+    """ratio 平滑会让连续 ratio 阶跃的「边界处」块之间更接近。
+
+    设计：连续用 ratio 序列 [1.0] * 10 + [1.5] * 10，win=5。
+    - 前 10 次：window=[1.0,...] → median=1.0
+    - 第 11 次 ratio=1.5：window=[1.0×4, 1.5×1] 中值=1.0（仍在过渡）
+    - 第 12 次 ratio=1.5：window=[1.0×3, 1.5×2] 中值=1.0（4 个值的中间偏小）
+    - 第 13 次 ratio=1.5：window=[1.0×2, 1.5×3] 中值=1.5（窗口过半）
+    - 第 14 次 ratio=1.5：window=[1.0×1, 1.5×4] 中值=1.5
+    - 第 15 次 ratio=1.5：window=[1.5×5] 中值=1.5
+
+    所以从「突变」到「完全 1.5」要 5 块过渡；不是瞬时。
+    """
+    s = vc.StreamingPitchShifter(256, ratio_smoothing_blocks=5)
+    ratios_seen = []
+    for r in ([1.0] * 10 + [1.5] * 10):
+        s.process(np.zeros(256, dtype=np.float32), r)
+        ratios_seen.append(s.ratio)
+    # 前 10 个 ratio 都是 1.0
+    check("ratio 平滑：前 10 个 ratio 全部=1.0",
+          all(abs(r - 1.0) < 1e-9 for r in ratios_seen[:10]),
+          f"前 5 个 = {[round(r, 3) for r in ratios_seen[:5]]}")
+    after = ratios_seen[10:]
+    # 期望 [1.0, 1.0, 1.5, 1.5, 1.5]
+    expected = [1.0, 1.0, 1.5, 1.5, 1.5]
+    check("ratio 平滑：突变后 5 个 ratio 渐变",
+          all(abs(a - e) < 1e-9 for a, e in zip(after[:5], expected)),
+          f"实际={[round(r, 3) for r in after[:5]]} 期望={expected}")
+    # 关键性质：第 12 次仍 < 1.5（说明不是瞬时跳变）
+    check("ratio 平滑：第 12 次 ratio 仍 < 1.5（说明有平滑延迟）",
+          after[1] < 1.5 - 1e-9, f"got {after[1]:.4f}")
+    # 第 13 次已 = 1.5（窗口过半）
+    check("ratio 平滑：第 13 次 ratio = 1.5（窗口已过半）",
+          abs(after[2] - 1.5) < 1e-9, f"got {after[2]:.4f}")
+
+
+def test_ratio_smoothing_window_size_1_is_no_op():
+    """ratio_smoothing_blocks=1 时 self.ratio 就是传入的 ratio（不引入历史）。"""
+    # 用三个独立 shifter，每次只跑一次 process 然后立刻检查
+    s1 = vc.StreamingPitchShifter(256, ratio_smoothing_blocks=1)
+    s1.process(np.zeros(256, dtype=np.float32), 1.3)
+    check("ratio_smoothing_blocks=1：传 1.3 → self.ratio = 1.3",
+          abs(s1.ratio - 1.3) < 1e-9, f"got {s1.ratio:.4f}")
+    s2 = vc.StreamingPitchShifter(256, ratio_smoothing_blocks=1)
+    s2.process(np.zeros(256, dtype=np.float32), 1.7)
+    check("ratio_smoothing_blocks=1：传 1.7 → self.ratio = 1.7",
+          abs(s2.ratio - 1.7) < 1e-9, f"got {s2.ratio:.4f}")
+    s3 = vc.StreamingPitchShifter(256, ratio_smoothing_blocks=1)
+    s3.process(np.zeros(256, dtype=np.float32), 0.8)
+    check("ratio_smoothing_blocks=1：传 0.8 → self.ratio = 0.8",
+          abs(s3.ratio - 0.8) < 1e-9, f"got {s3.ratio:.4f}")
+    check("ratio_smoothing_blocks=1：_ratio_window 始终为空",
+          s1._ratio_window == [], f"got {s1._ratio_window}")
+
+
+def test_phase_jitter_disabled():
+    """phase_jitter=0 时两次跑同一段音频应输出**完全相同**（同一 RNG 种子）。"""
+    y = vowel_like(f0=180.0, formants=(500.0, 1500.0, 2500.0), dur=0.6)
+    a = vc.process_offline(y, SR, semitones=4.0, formant_correct=True,
+                           form_shift_ratio=1.0, phase_jitter=0.0)
+    b = vc.process_offline(y, SR, semitones=4.0, formant_correct=True,
+                           form_shift_ratio=1.0, phase_jitter=0.0)
+    check("phase_jitter=0：两次跑严格相同",
+          np.allclose(a, b), f"max|a-b|={float(np.max(np.abs(a-b))):.2e}")
+
+
+def test_phase_jitter_preserves_harmonic_structure():
+    """phase_jitter 加的是每帧一个公共随机偏移 → 帧内相对关系不变 → 频谱峰值位置不变。
+
+    设计：合成基频 F0=200Hz 谐波序列。开了 phase_jitter 后：
+      - dominant_freq 应仍在 200Hz 附近（同一帧内谐波相对关系没变）
+      - rms 应仍在合理范围（没把信号削掉）
+    """
+    sr = SR
+    f0 = 200.0
+    t = np.arange(int(sr * 0.6)) / sr
+    # 8 个谐波 + F1=500Hz 加权（让主峰在 200）
+    x = np.zeros_like(t)
+    for k in range(1, 9):
+        x += np.sin(2 * np.pi * f0 * k * t) / k
+    x = (x / np.max(np.abs(x)) * 0.5).astype(np.float32)
+    y_off = vc.process_offline(x, sr, semitones=0.0, formant_correct=True,
+                               form_shift_ratio=1.0, phase_jitter=0.0,
+                               ratio_smoothing_blocks=1)
+    y_on = vc.process_offline(x, sr, semitones=0.0, formant_correct=True,
+                              form_shift_ratio=1.0, phase_jitter=0.30,
+                              ratio_smoothing_blocks=1)
+    f_off = dominant_freq(y_off, sr, lo=50.0, hi=400.0)
+    f_on = dominant_freq(y_on, sr, lo=50.0, hi=400.0)
+    check("phase_jitter：开启后主峰仍在 F0=200Hz 附近",
+          abs(f_on - f0) < 20.0,
+          f"f_off={f_off:.1f}Hz f_on={f_on:.1f}Hz")
+    check("phase_jitter：开启后 rms 仍在合理范围（0.05 ~ 0.5）",
+          0.05 < rms(y_on) < 0.5,
+          f"rms={rms(y_on):.3f}")
+
+
+def test_phase_jitter_differs_from_disabled():
+    """phase_jitter > 0 时两次跑同一段音频应**不同**（随机相位起作用了）。"""
+    y = vowel_like(f0=180.0, formants=(500.0, 1500.0, 2500.0), dur=0.6)
+    a = vc.process_offline(y, SR, semitones=4.0, formant_correct=True,
+                           form_shift_ratio=1.0, phase_jitter=0.30)
+    b = vc.process_offline(y, SR, semitones=4.0, formant_correct=True,
+                           form_shift_ratio=1.0, phase_jitter=0.30)
+    diff = float(np.max(np.abs(a - b)))
+    check("phase_jitter>0：两次跑出**不同**输出",
+          diff > 1e-6, f"max|a-b|={diff:.2e}")
+
+
+def test_phase_jitter_per_block_latency():
+    """phase_jitter=0.30 时 process_offline 单块平均耗时应 < B=512 块时长预算 80%。"""
+    import time
+    y = vowel_like(f0=180.0, formants=(500.0, 1500.0, 2500.0), dur=2.0)
+    B = 512
+    pad = (-y.size) % B
+    if pad:
+        y = np.concatenate([y, np.zeros(pad, np.float32)])
+    pipe = vc.VoicePipeline(SR, B, formant_correct=True,
+                            ratio_smoothing_blocks=1, phase_jitter=0.30)
+    # 预热
+    for i in range(0, y.size, B):
+        pipe.process(y[i:i + B], 4.0, form_shift_ratio=1.0)
+    pipe.reset()
+    t0 = time.perf_counter()
+    n_blocks = 0
+    for i in range(0, y.size, B):
+        pipe.process(y[i:i + B], 4.0, form_shift_ratio=1.0)
+        n_blocks += 1
+    elapsed = time.perf_counter() - t0
+    per_block_ms = elapsed / n_blocks * 1000
+    budget_ms = B / SR * 1000 * 0.8
+    check(f"phase_jitter=0.30 单块 {per_block_ms:.2f}ms < 预算 {budget_ms:.2f}ms (80%)",
+          per_block_ms < budget_ms,
+          f"blocks={n_blocks} total={elapsed*1000:.1f}ms")
+
+
 def main():
     print(f"numpy {np.__version__}, 采样率 {SR}\n")
     for fn in (test_identity_exact, test_identity_noise, test_pitch_ratio, test_duration_and_rms,
@@ -812,7 +966,12 @@ def main():
                test_lpc_envelope_positive_finite, test_lpc_envelope_smoother_than_max_filter,
                test_lpc_envelope_correlates_with_true, test_lpc_envelope_peak_locations,
                test_envelope_method_selection, test_default_envelope_method_is_lpc,
-               test_formant_corrector_lpc_does_not_crash_pipeline):
+               test_formant_corrector_lpc_does_not_crash_pipeline,
+               test_ratio_smoothing_basic, test_ratio_smoothing_smoothes_transitions,
+               test_ratio_smoothing_window_size_1_is_no_op,
+               test_phase_jitter_disabled, test_phase_jitter_preserves_harmonic_structure,
+               test_phase_jitter_differs_from_disabled,
+               test_phase_jitter_per_block_latency):
         print(f"--- {fn.__name__} ---")
         fn()
         print()

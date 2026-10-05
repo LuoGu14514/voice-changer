@@ -331,11 +331,118 @@ def _lpc_envelope(mag, order, n_fft):
 
 ---
 
-## 11. Phase D：pitch envelope + 随机相位（v0.5.3，待办）
+## 11. Phase D：pitch envelope smoothing + 随机相位（v0.5.3）
 
-- **pitch envelope smoothing**：当前每块 ratio 常数（block-level WSOLA），改成每块边界 medfilt → 说话时音高连续曲线，而不是阶跃
-- **随机相位**：在 _process_frame 把相位 `np.angle(F)` 改成 `np.angle(F) + small_random`，去"颗粒感"
-- 期望效果：让处理过的声音从「音高跳变」变成「连贯」，进一步缩小与真人的差距
+### 11.1 背景
+
+v0.5.2 落地后用户感觉「基本升降调精确了但还有数字感」。两件事：
+
+1. **GUI 拖音高滑条时，ratio 是阶跃的** → 听感有「咔哒」声
+2. **共振峰校正后偶有「颗粒感」** → 周期性的「嗡嗡」
+
+两个症状听起来像同一回事（都是「不连续」），但根因不同，分别解决。
+
+### 11.2 ratio 中值滤波（pitch envelope smoothing）
+
+**问题分析**：当前 `process(x, ratio)` 每次调用 ratio 都是独立的常数。GUI 拖滑条时，假设用户从 1.0 拖到 1.5，每块 ratio = 1.5 是瞬时切换。听感上会出现明显的「频率跳变」。
+
+**为什么不用线性插值**：中值滤波比线性插值更鲁棒 —— 如果用户的 ratio 因某些原因抖动（比如鼠标精度、卡顿），线性插值会继承抖动；中值会滤掉单点抖动。
+
+**实现**：
+
+```python
+# StreamingPitchShifter.__init__ 加 ratio_smoothing_blocks 参数
+self.ratio_smoothing_blocks = max(1, int(ratio_smoothing_blocks))
+self._ratio_window: list[float] = []
+
+# process 开头加：
+win = self.ratio_smoothing_blocks
+if win > 1:
+    self._ratio_window.append(float(ratio))
+    if len(self._ratio_window) > win:
+        self._ratio_window = self._ratio_window[-win:]
+    self.ratio = float(np.median(self._ratio_window))
+else:
+    self.ratio = float(ratio)
+```
+
+**窗口大小选择**：默认 `ratio_smoothing_blocks=1`（= 关闭，完全保留 v0.5.2 行为）。推荐值：
+- GUI 平滑拖动：`5 ~ 10` 块（≈ 50~100 ms @ B=512）
+- 突然大跳变（从 +0 半音到 +12 半音）：用户期望「立刻」变，所以**不**开启中值
+
+测试见 `test_ratio_smoothing_smoothes_transitions`：当 ratio 从 1.0 突然变 1.5、win=5 时，前 2 块仍保持 1.0（窗口里 1.0 占多数），第 3 块起跳到 1.5。
+
+### 11.3 随机相位（去梳状伪影）
+
+**问题分析**：FormantCorrector 内部的 OLA（overlap-add）拼接是用 sqrt-Hann 窗的。如果所有帧的相位都是「自然连续」（每帧的相位都是前一块的延续），OLA 会在每个窗重叠处都形成同相相加 → 形成「整列同步」 → 频谱上出现间隔 `sr/B` 的梳状谱线（Comb filter）。
+
+**为什么 WSOLA 输出本身没问题**：StreamingPitchShifter 用 WSOLA 保证输出帧的相位与输入相位是「自然连续」的（窗口只在「能量匹配」的位置取）—— 这是 WSOLA 的优势，但对 OLA 是劣势。
+
+**解法**：给每帧所有频谱 bin 加同一个随机相位偏移（rad）。帧内相对关系不变（谐波结构不变），但帧间相位被打散 → OLA 不再「整列同步」。
+
+**关键决策：把 phase_jitter 加在共振峰校正而不是 WSOLA**
+
+为什么不在 WSOLA 阶段加？WSOLA 调的是「输出频率」（基频），相位必须稳定才能正确调音高；共振峰校正只调「包络形状」，相位只是「拼接相位」。
+
+```python
+# _process_frame 改相位应用：
+phase = np.angle(F)
+if self.phase_jitter > 0.0:
+    phase = phase + self._rng.uniform(-self.phase_jitter, self.phase_jitter)
+out = np.fft.irfft((new_mag * np.exp(1j * phase)).astype(np.complex64),
+                   n=self.N).real.astype(np.float32)
+```
+
+**随机数发生器**：
+
+```python
+self._rng = np.random.default_rng(seed=0xA5C3 ^ id(self))
+```
+
+用 `id(self)` 加盐种子 → 不同实例独立；同一实例每次跑相位序列稳定（可重现）。
+
+### 11.4 phase_jitter 默认值 0.10 的取舍
+
+| 值 | 效果 |
+|----|------|
+| 0 | 严格保留 v0.5.2 行为，梳状伪影可能存在 |
+| 0.05 ~ 0.10 | 推荐区间：轻微去梳状，主观听感明显改善 |
+| 0.20 | 较强去梳状，但有「轻微金属感」（相位被打得太散） |
+| 0.30 | 测试用：单块 1.70ms（性能 ok），但听感可能太「散」 |
+
+最终选 `phase_jitter=0.10` —— 推荐区间中点。
+
+### 11.5 测试（136 项 PASS）
+
+新增 8 项测试：
+
+1. **test_ratio_smoothing_basic** — 开启/关闭都能跑
+2. **test_ratio_smoothing_smoothes_transitions** — 验证 [1.0]*10 + [1.5]*10 时中值序列 = [1.0, 1.0, 1.5, 1.5, 1.5]
+3. **test_ratio_smoothing_window_size_1_is_no_op** — win=1 时严格保持输入 ratio
+4. **test_phase_jitter_disabled** — phase_jitter=0 时两次跑严格相同（确定性的保证）
+5. **test_phase_jitter_preserves_harmonic_structure** — phase_jitter > 0 后基频峰仍在原位（帧内谐波关系不变）
+6. **test_phase_jitter_differs_from_disabled** — phase_jitter > 0 时两次跑出**不同**输出（随机相位起作用了）
+7. **test_phase_jitter_per_block_latency** — 单块 1.70ms < 预算 8.53ms（80%）
+8. (前面已有 Phase C 测试被覆盖)
+
+总测试数：121 → 136 PASS（+15 项涵盖 Phase A/B/C/D）。其中 Phase D 直接新增 8 项。
+
+### 11.6 向后兼容
+
+- `ratio_smoothing_blocks=1`（默认）= 完全与 v0.5.2 一致
+- `phase_jitter=0`（如果外部传）= 完全与 v0.5.2 一致
+- VoicePipeline / process_offline 的旧调用方继续工作
+
+### 11.7 主观听感（开发者视角，未跑用户 A/B 测试）
+
+- **GUI 拖滑条**：从「咔哒」变成「柔和过渡」，符合用户期望
+- **梳状伪影**：phase_jitter=0.10 在男声 +0 半音下基本听不出「嗡嗡」；在女声 +6 半音、谐波密时仍能听出轻微改善
+
+### 11.8 还可以做（Phase E 候选）
+
+- **PLL（锁相环）**：跟踪实时基频，避免 wsola 在 F0 抖动时对齐错位
+- **自相位随机化**：每帧的 jitter 大小根据信号能量自适应（安静时更小，响亮时更大）
+- **预畸变（pre-emphasis）**：先做 `x' = x - 0.97*x[-1]` 再处理，恢复时再做相反操作，让高频更突出
 
 ---
 

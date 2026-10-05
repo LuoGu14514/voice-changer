@@ -214,7 +214,8 @@ class StreamingPitchShifter:
     """
 
     def __init__(self, block_size: int = 512, max_ratio: float = 2.0,
-                 align: bool = True, search_ratio: float = 0.25):
+                 align: bool = True, search_ratio: float = 0.25,
+                 ratio_smoothing_blocks: int = 1):
         self.B = int(block_size)
         self.W = 2 * self.B
         self.max_ratio = float(max_ratio)
@@ -230,6 +231,8 @@ class StreamingPitchShifter:
         self.span = int(np.ceil(self.max_ratio * self.W)) + self.search + 8
         self.ring_len = 1 << max(4, int(np.ceil(np.log2(
             self.span + self.W + self.search + 4 * self.B + 32))))
+        # v0.5.3 Phase D：ratio 中值滤波窗（1 = 不平滑；>1 = 保留最近 N 次 ratio 的中值）
+        self.ratio_smoothing_blocks = max(1, int(ratio_smoothing_blocks))
         self.reset()
 
     # ---------------------------------------------------------------- 状态
@@ -243,6 +246,8 @@ class StreamingPitchShifter:
         self.has_acc = False
         self.ratio = 1.0
         self.read_overflow = 0   # 诊断用：读到还没写入的采样就 +1（应为 0）
+        # ratio 中值滤波窗（v0.5.3 Phase D）：保留最近 N 次 ratio 的中值
+        self._ratio_window: list[float] = []
 
     @property
     def latency_samples(self) -> int:
@@ -275,9 +280,22 @@ class StreamingPitchShifter:
 
     # ---------------------------------------------------------------- 处理
     def process(self, x, ratio: float) -> np.ndarray:
-        """输入一块（长度 B）采样，返回同长度的变调结果。"""
+        """输入一块（长度 B）采样，返回同长度的变调结果。
+
+        v0.5.3 Phase D：ratio 中值滤波（仅在 ratio_smoothing_blocks > 1 时启用）。
+        用途：用户在 GUI 上拖滑条改音高时，传入的 ratio 是阶跃的；保留
+        最近 N 次的 ratio 取中值，可以把阶跃变成平滑过渡，听感更自然。
+        """
         B, W, R = self.B, self.W, self.ring_len
-        self.ratio = float(ratio)
+        # v0.5.3 Phase D：ratio 中值滤波
+        win = self.ratio_smoothing_blocks
+        if win > 1:
+            self._ratio_window.append(float(ratio))
+            if len(self._ratio_window) > win:
+                self._ratio_window = self._ratio_window[-win:]
+            self.ratio = float(np.median(self._ratio_window))
+        else:
+            self.ratio = float(ratio)
 
         x = np.asarray(x, dtype=np.float32).reshape(-1)
         if x.size != B:
@@ -356,11 +374,17 @@ class FormantCorrector:
     性能：B=512 / N=1024 时，每块 2 次 rfft + 1 次 max_filter，纯 numpy
     < 2 ms（B=256 时 1 ms，B=1024 时 4 ms，实测预算充足）。
     延迟：latency_samples = 2 * B（第一个块返回零，第二块开始有正确输出）。
+
+    v0.5.3 Phase D 新增：phase_jitter（默认 0 = 关闭；推荐 0.05 ~ 0.20）。
+    OLA 拼接时如果所有帧的相位都相关，会出现"整列同步"的相位 → 形成间隔
+    sr/B 的梳状谱伪影，听起来像"颗粒感"。给每帧所有频谱 bin 加同一个
+    随机偏移（不破坏帧内结构），能让帧间相位不再同步，从而打散伪影。
     """
 
     def __init__(self, block_size: int = 512, fft_size: int | None = None,
                  filt_bins: int = 24, lpc_order: int | None = None,
-                 envelope_method: str = "lpc"):
+                 envelope_method: str = "lpc",
+                 phase_jitter: float = 0.0):
         self.B = int(block_size)
         self.N = int(fft_size) if fft_size else 2 * self.B
         # hop = N/2 → 50% overlap，sqrt-Hann 满足 COLA（sum = 1）
@@ -381,6 +405,12 @@ class FormantCorrector:
             # 选一个对典型语音 F1=500Hz 友好的默认值
             lpc_order = max(20, self.N // 20)
         self.lpc_order = int(lpc_order)
+        # v0.5.3 Phase D：相位随机化（每帧一个公共随机偏移）
+        # 给每帧的所有频谱 bin 加同一个随机相位偏移（rad），不会破坏帧内
+        # 谐波结构，但能让帧与帧之间的相位不相关 → 减少 OLA 的"梳状谱线"伪影。
+        # 0 = 关闭（向后兼容）；推荐 0.05 ~ 0.20（小幅即可）。
+        self.phase_jitter = max(0.0, float(phase_jitter))
+        self._rng = np.random.default_rng(seed=0xA5C3 ^ id(self))
         # sqrt-Hann：分析和综合各用一次，乘起来满足 COLA
         hann = 0.5 - 0.5 * np.cos(2.0 * np.pi * np.arange(self.N) / self.N)
         self.win = (hann.astype(np.float32) ** 0.5)
@@ -532,8 +562,13 @@ class FormantCorrector:
 
         # 4) 重组：残谱（保留了 WSOLA 给的谐波列位置）× 包络（搬到 form_shift 位置）
         new_mag = (residual * env).astype(np.float32)
-        # 相位保持原样（残谱本身没动，OLA 自然做相位对齐）
-        out = np.fft.irfft((new_mag * np.exp(1j * np.angle(F))).astype(np.complex64),
+        # 相位：默认原样；v0.5.3 Phase D 启用 phase_jitter 时给整帧加公共随机偏移。
+        # 帧内所有 bin 加同一个偏移 → 谐波相对关系不变；帧间相位被打散 →
+        # OLA 不再形成「整列同步」的相位 → 减少梳状谱伪影（颗粒感）。
+        phase = np.angle(F)
+        if self.phase_jitter > 0.0:
+            phase = phase + self._rng.uniform(-self.phase_jitter, self.phase_jitter)
+        out = np.fft.irfft((new_mag * np.exp(1j * phase)).astype(np.complex64),
                            n=self.N).real.astype(np.float32)
         # 综合窗
         return out * self.win
@@ -608,11 +643,18 @@ class VoicePipeline:
     """
 
     def __init__(self, samplerate: int = 48000, block_size: int = 512,
-                 formant_correct: bool = True, align: bool = True):
+                 formant_correct: bool = True, align: bool = True,
+                 ratio_smoothing_blocks: int = 1,
+                 phase_jitter: float = 0.10):
         self.sr = int(samplerate)
         self.B = int(block_size)
-        self.shifter = StreamingPitchShifter(self.B, align=align)
-        self.formant = FormantCorrector(self.B) if formant_correct else None
+        self.shifter = StreamingPitchShifter(
+            self.B, align=align,
+            ratio_smoothing_blocks=ratio_smoothing_blocks,
+        )
+        # v0.5.3 Phase D：phase_jitter 默认开启（小值 0.10），让 OLA 不再像梳状
+        self.formant = (FormantCorrector(self.B, phase_jitter=phase_jitter)
+                        if formant_correct else None)
         # 直接用 EffectRack（不走 EffectChain 包装）以支持多效果组合
         self.effects = EffectRack(self.sr, self.B)
         self._form_shift = 1.0
@@ -710,7 +752,9 @@ def process_offline(x, samplerate: int, semitones: float = 0.0, effect: str = "n
                     block_size: int = 512, gain: float = 1.0,
                     align: bool = True, formant_correct: bool = False,
                     form_shift_ratio: float = 1.0,
-                    effects_config: dict | None = None) -> np.ndarray:
+                    effects_config: dict | None = None,
+                    ratio_smoothing_blocks: int = 1,
+                    phase_jitter: float = 0.10) -> np.ndarray:
     """离线处理一整段音频（文件变声用）。输出长度与输入一致。
 
     effect / effects_config：
@@ -722,14 +766,21 @@ def process_offline(x, samplerate: int, semitones: float = 0.0, effect: str = "n
     formant_correct 默认 False（opt-in）：
     共振峰校正在简单信号（纯音/合成测试）上会把信号削掉（residual×env
     模型假设有清晰的谐波列+包络分离），但在真人语音/复杂音频上才真正发挥
-    「拉回共振峰」的效果。CLI/GUI 想要更「真人」效果时显式打开。"""
+    「拉回共振峰」的效果。CLI/GUI 想要更「真人」效果时显式打开。
+
+    v0.5.3 Phase D 新增：
+      - ratio_smoothing_blocks（默认 1 = 不平滑；>1 让 ratio 滑条拖动时更自然）
+      - phase_jitter（默认 0.10 rad；0 关闭，>0 让 OLA 不再像梳状）
+    """
     x = np.asarray(x, dtype=np.float32).reshape(-1)
     if x.size == 0:
         return x
     B = int(block_size)
     pipe = VoicePipeline(samplerate, B,
                          formant_correct=bool(formant_correct),
-                         align=align)
+                         align=align,
+                         ratio_smoothing_blocks=ratio_smoothing_blocks,
+                         phase_jitter=phase_jitter)
     ratio = semitones_to_ratio(semitones)
     delay = pipe.latency_samples
 

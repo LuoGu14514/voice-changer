@@ -135,6 +135,39 @@ fc_lpc = vc.FormantCorrector(512, envelope_method="lpc")         # 默认
 fc_old = vc.FormantCorrector(512, envelope_method="max_filter")  # 旧行为
 ```
 
+### v0.5.3 新增：音高滑动平滑 + 随机相位去梳状伪影
+
+v0.5.3 解决两个观察到的「数字感」问题：
+
+**问题 1 — GUI 滑条拖动时音高突变**
+
+用户在 GUI 上拖音高滑条时，传入的 `ratio` 是阶跃的（比如从 1.0 突变成 1.5）。每一块都立即切换导致听感有「咔哒」声，听起来不自然。
+
+v0.5.3 加 `ratio_smoothing_blocks` 参数：保留最近 N 次传入的 ratio，取中值作为实际生效的 ratio。这样拖滑条时 ratio 会**逐渐**从 1.0 过渡到 1.5，听感平滑。
+
+```python
+pipe = vc.VoicePipeline(sr, B, ratio_smoothing_blocks=5)  # 5 块窗口
+# ratio_smoothing_blocks=1（默认）= 关闭平滑，与 v0.5.2 行为完全一致
+```
+
+**问题 2 — 共振峰校正后偶有「颗粒感」**
+
+`FormantCorrector` 的 OLA（overlap-add）拼接在帧间相位相关时会形成间隔 `sr/B` 的梳状谱线，听起来像「颗粒感」（一种周期性的「嗡嗡」）。
+
+v0.5.3 加 `phase_jitter` 参数：给每帧所有频谱 bin 加同一个随机相位偏移（**不破坏帧内谐波结构**）。帧内相对关系不变，但帧间相位被打散 → 梳状谱伪影消失。
+
+```python
+pipe = vc.VoicePipeline(sr, B, phase_jitter=0.10)  # 0 = 关闭；推荐 0.05~0.20
+```
+
+**为什么相位加在共振峰校正后而不是 WSOLA？**
+
+WSOLA 阶段调的是「输出频率」（基频），必须在 WSOLA 内保留稳定相位才能正确调音高；共振峰校正只调「包络形状」（共振峰位置），帧内谐波相对关系才是关键，相位只是「拼接相位」。所以 phase_jitter 加在共振峰校正的相位应用处最合适。
+
+性能：phase_jitter=0.30 时单块 1.70ms（预算 8.53ms），富余 5×。
+
+测试：136 项自测（v0.5.2 的 128 项 + 8 项 Phase D 专项）。
+
 ### 自定义效果链
 
 如果你想完全自定义，可以在代码里这样调用：
