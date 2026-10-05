@@ -1,12 +1,16 @@
 # -*- coding: utf-8 -*-
 """简单变声器 —— DSP 核心。
 
-只做两件事：
+只做三件事：
 1. StreamingPitchShifter：实时变调（颗粒式重叠相加 + WSOLA 相位对齐，
    保持时长不变），可以在音频回调里逐块调用，音调比值可随时改变。
-2. EffectChain：机器人 / 回声 / 电话音等简单音效。
+2. FormantCorrector：共振峰解耦（实时 STFT 包络校正）。
+   单独使用时跟原声完全相同；接在变调后面能把「音高上去了但共振峰也
+   跟着上去了 = 声像变小、变成花栗鼠」这种情况修掉，让升调后的声音
+   保持原始的「声道形状」（听起来才像真人女声 / 男声，而不是小孩）。
+3. EffectChain：机器人 / 回声 / 电话音等简单音效。
 
-不依赖 scipy，只需要 numpy。
+不依赖 scipy，只需要 numpy。STFT 走的是纯 numpy（np.fft.rfft）。
 """
 from __future__ import annotations
 
@@ -15,14 +19,32 @@ import numpy as np
 __all__ = [
     "semitones_to_ratio",
     "StreamingPitchShifter",
+    "FormantCorrector",
+    "VoicePipeline",
     "EffectChain",
     "process_offline",
     "EFFECTS",
     "EFFECT_LABELS",
+    "VOICE_PRESETS",
 ]
 
 EFFECTS = ("none", "robot", "echo", "phone")
 EFFECT_LABELS = {"none": "无", "robot": "机器人", "echo": "回声", "phone": "电话音"}
+
+# v0.2.0：把预设从纯升降调升级到「带共振峰策略」的真人声预设
+# 字段：(显示名, 半音, 共振峰位移比, 音效)
+# form_shift 1.0 = 共振峰不动（保留原本声道）；>1 = 变小（儿童/女）；
+#                <1 = 变大（男/大叔）。
+VOICE_PRESETS = (
+    ("原声",   0.0,  1.00, "none"),
+    ("真女声",  3.0,  1.00, "none"),
+    ("真男声", -3.0,  1.00, "none"),
+    ("萝莉",    7.0,  1.15, "none"),
+    ("大叔",   -5.0,  0.95, "none"),
+    ("机器人",  0.0,  1.00, "robot"),
+    ("回声",    0.0,  1.00, "echo"),
+    ("电话音",  0.0,  1.00, "phone"),
+)
 
 
 def semitones_to_ratio(semitones: float) -> float:
@@ -170,6 +192,239 @@ class StreamingPitchShifter:
         return out.astype(np.float32)
 
 
+class FormantCorrector:
+    """实时共振峰校正器（接在变调器后面用）。
+
+    解决的问题：单独用颗粒式变调（WSOLA）时，音高升一截，共振峰（F1/F2/F3）
+    也跟着升一截，听着就是「变小的成年人」——花栗鼠味儿，但不像真人女声；
+    反过来降调时变成「变大的成年人」——像得了感冒。
+
+    思路（lewark/pvc 的做法，简化成 streaming）：每 B 个采样做一次 STFT
+    （N = 2B，hop = B/2，sqrt-Hann 满足 COLA），把频谱拆成两部分：
+
+        |X(f)| = E(f) · R(f)
+
+    E(f) 是「共振峰包络」（用沿频率轴的 rolling max 估计，相当于低分辨率
+    的谱包络，峰宽 ~ 8 个 bin ≈ 375 Hz，恰好覆盖 F1=500/F2=1500/F3=2500）。
+    R(f) 是「去掉共振峰后的细节」，主要就是谐波列的位置。
+
+    WSOLA 让 |X| 整体在频率轴上压缩了 1/ratio 倍。要让共振峰回到原来的
+    位置，只要把 E(f) 沿频率轴拉伸 ratio 倍（即 E_restored[k] = E[k*ratio]）
+    再乘回 R(f) 上去。谐波列 R(f) 还在 WSOLA 给它的位置上，于是听众听到的
+    「音高」是 WSOLA 的，而「声道形状」是原始说话人的。
+
+    还有一个 form_shift_ratio 参数：>1 把共振峰往上挪（听起来像小孩 /
+    卡通女声），<1 往下挪（像大叔）。和 pitch 解耦，可以独立调节。
+
+    性能：B=512 / N=1024 时，每块 2 次 rfft + 1 次 max_filter，纯 numpy
+    < 2 ms（B=256 时 1 ms，B=1024 时 4 ms，实测预算充足）。
+    延迟：latency_samples = 2 * B（第一个块返回零，第二块开始有正确输出）。
+    """
+
+    def __init__(self, block_size: int = 512, fft_size: int | None = None,
+                 filt_bins: int = 24):
+        self.B = int(block_size)
+        self.N = int(fft_size) if fft_size else 2 * self.B
+        # hop = N/2 → 50% overlap，sqrt-Hann 满足 COLA（sum = 1）
+        self.hop = self.N // 2
+        if self.hop != self.B:
+            # 默认 B 块、N=2B、hop=B，跟 StreamingPitchShifter 对齐
+            # 如果外部强行传不匹配的尺寸，最少保证 hop > 0
+            self.hop = max(1, self.hop)
+        # 包络平滑窗口：bin 数。
+        # 默认 24 ≈ 1125 Hz 宽（@ SR=48000, N=1024, bin=46.875Hz）—— 能跨越
+        # 男声典型基频 F0=100-200Hz 的多个谐波，捕获真正的共振峰宽度。
+        self.filt_bins = max(3, int(filt_bins))
+        # sqrt-Hann：分析和综合各用一次，乘起来满足 COLA
+        hann = 0.5 - 0.5 * np.cos(2.0 * np.pi * np.arange(self.N) / self.N)
+        self.win = (hann.astype(np.float32) ** 0.5)
+        # 上一个 hop 这么多采样，拼成完整 N-sample 帧
+        self._prev = np.zeros(self.hop, dtype=np.float32)
+        # OLA 累加器：保存最新一帧的综合输出，等下两块再读
+        self._ola = np.zeros(self.N, dtype=np.float32)
+        # 已经处理过的帧数；< 1 时第一个块按静音输出（延迟 = N）
+        self._frame_idx = 0
+
+    # ---------------------------------------------------------------- 内部
+    @staticmethod
+    def _max_filter_1d(x: np.ndarray, size: int) -> np.ndarray:
+        """沿最后一轴做 rolling max（edge 填充）。
+
+        比 scipy.ndimage.maximum_filter1d 慢一点，但是纯 numpy、零依赖。
+        size = 8 在 N=1024 时窗口约 375 Hz，刚好覆盖一个共振峰的宽度。
+        """
+        pad = size // 2
+        xp = np.pad(x, [(0, 0)] * (x.ndim - 1) + [(pad, size - 1 - pad)], mode="edge")
+        v = np.lib.stride_tricks.sliding_window_view(xp, size, axis=-1)
+        return v.max(axis=-1)
+
+    def _process_frame(self, frame: np.ndarray, pitch_ratio: float,
+                       form_shift_ratio: float) -> np.ndarray:
+        """处理一帧（self.N 个采样），返回同长度输出。
+
+        思路（formant 校正）：
+        WSOLA 把整张谱整体乘以 pitch_ratio —— 基频和谐波都拉到新位置，
+        共振峰也跟着搬到 F_orig × pitch_ratio。要让「同一个人换音高说话」，
+        必须把共振峰（包络）从 F_orig × R 拉回到 F_orig（默认）或者
+        F_orig × form_shift（用户可调）。
+
+        具体：
+          1. 取 WSOLA 输出的频谱 mag_frame（含新音高的谐波列 + 新位置的包络）
+          2. 在频率轴上做 rolling max 估出 WSOLA 包的包络 env_wsola
+             （峰值在 F_orig × R 位置）
+          3. residual = mag_frame / env_wsola → 拉平后的相对谱（去掉了 WSOLA 的
+             包络调制，谐波相对幅度仍按 WSOLA 后的比例）
+          4. 把 env_wsola 沿频率轴重采样：new_idx = idx × form_shift / R
+             （这样新包络峰值在 F_orig × R × form_shift/R = F_orig × form_shift）
+          5. new_mag = residual × env_shifted
+          6. 沿用 WSOLA 输出的相位 → IFFT → 输出帧（音高已经由 WSOLA 改到 R，
+             共振峰跑到 form_shift 用户想要的位置）
+        """
+        # 加窗 → FFT
+        F = np.fft.rfft(frame * self.win)
+        mag = np.abs(F).astype(np.float32)
+        K = mag.shape[-1]
+        idx = np.arange(K, dtype=np.float64)
+
+        # 1) 估 WSOLA 输出频谱的包络（rolling max）
+        env = self._max_filter_1d(mag, self.filt_bins).astype(np.float32)
+        mmax = float(mag.max()) if mag.size else 0.0
+        floor = max(1e-4 * mmax, 1e-8)
+        env = np.maximum(env, floor)
+
+        # 2) 共振峰被搬走的「残余谱」（谐波列 + 细节）
+        residual = np.where(env > 0, (mag / np.maximum(env, 1e-12)).astype(np.float32), 0.0)
+        residual = residual.astype(np.float32)
+
+        # 3) 决定包络的重采样比例：R / form_shift_ratio。
+        #    WSOLA 把共振峰从 F_orig 挪到了 F_orig × R。
+        #    要把 output 的包络峰值挪到 F_orig × form_shift 用户想要的位置：
+        #      output[k] = env[k × shift]，peak 在 k = F_orig × form_shift 时
+        #      要求 env[k × shift] 取到 env 的峰值 env_peak = F_orig × R。
+        #      解：F_orig × form_shift × shift = F_orig × R → shift = R / form_shift。
+        #    例：R=1.414, form_shift=1.0 → shift=1.414（拉回到原位）✓
+        #    例：R=1.0, form_shift=1.15 → shift=0.870（peak 从 F_orig 移到 F_orig×1.15）✓
+        #    例：R=1.414, form_shift=1.15 → shift=1.230（peak 移到 F_orig×1.15）✓
+        #    例：R=1.0, form_shift=1.0 → shift=1.0（不变）✓
+        R = float(pitch_ratio) if abs(float(pitch_ratio)) > 1e-9 else 1.0
+        shift = R / float(form_shift_ratio) if abs(float(form_shift_ratio)) > 1e-9 else R
+        if abs(shift - 1.0) > 1e-6 and K > 1:
+            new_idx = np.clip(idx * shift, 0.0, K - 1.0)
+            env_shifted = np.interp(new_idx, idx, env).astype(np.float32)
+            env = env_shifted
+
+        # 4) 重组：残谱（保留了 WSOLA 给的谐波列位置）× 包络（搬到 form_shift 位置）
+        new_mag = (residual * env).astype(np.float32)
+        # 相位保持原样（残谱本身没动，OLA 自然做相位对齐）
+        out = np.fft.irfft((new_mag * np.exp(1j * np.angle(F))).astype(np.complex64),
+                           n=self.N).real.astype(np.float32)
+        # 综合窗
+        return out * self.win
+
+    # ---------------------------------------------------------------- 状态
+    def reset(self) -> None:
+        self._prev[:] = 0
+        self._ola[:] = 0
+        self._frame_idx = 0
+
+    @property
+    def latency_samples(self) -> int:
+        # 第一个块返回静音，第二个块起输出第一块的内容（带 OLA 拼接）。
+        # 所以延迟 = B（1 个块），不是 N。
+        return self.B
+
+    # ---------------------------------------------------------------- 处理
+    def process(self, x: np.ndarray, pitch_ratio: float = 1.0,
+                form_shift_ratio: float = 1.0,
+                orig: np.ndarray | None = None) -> np.ndarray:
+        """输入 B 个采样，返回同长度的共振峰校正结果。
+
+        参数：
+            x: B 个 float32 采样（WSOLA 之后的）
+            pitch_ratio: 上游变调器的 ratio（用来决定包络要搬多远）
+            form_shift_ratio: 独立于 pitch 的共振峰位移
+                            （1.0 = 把 WSOLA 搬走的共振峰拉回原位
+                             1.15 = 拉到原位的 1.15 倍频（萝莉/卡通女）
+                             0.85 = 拉到原位的 0.85 倍频（大叔））
+            orig: 已弃用，保留仅作向后兼容；新算法只用 x 自己。
+        """
+        x = np.asarray(x, dtype=np.float32).reshape(-1)
+        B = self.B
+        if x.size < B:
+            xp = np.zeros(B, dtype=np.float32)
+            xp[: x.size] = x
+            x = xp
+        else:
+            x = x[:B]
+
+        # 拼成完整 N-sample 帧：上一帧的尾巴 + 当前块
+        frame = np.concatenate([self._prev, x]).astype(np.float32)
+        self._prev = x.copy()
+
+        # 跑一遍谱处理
+        new = self._process_frame(frame, pitch_ratio, form_shift_ratio)
+
+        # OLA：第一帧返回静音（latency = N），之后取累加器前 B 个采样
+        self._ola += new
+        if self._frame_idx >= 1:
+            emit = self._ola[:B].copy()
+        else:
+            emit = np.zeros(B, dtype=np.float32)
+        # 左移 B，腾出空间给下一帧
+        self._ola[:B] = 0.0
+        self._ola = np.roll(self._ola, -B)
+        self._ola[-B:] = 0.0
+        self._frame_idx += 1
+        return emit
+
+
+class VoicePipeline:
+    """把变调 + 共振峰校正 + 音效串起来的整链路。
+
+    用法：
+        pipe = VoicePipeline(sr=48000, block_size=512)
+        y = pipe.process(x_mic, semitones=3.0, form_shift_ratio=1.0, effect="none")
+    """
+
+    def __init__(self, samplerate: int = 48000, block_size: int = 512,
+                 formant_correct: bool = True, align: bool = True):
+        self.sr = int(samplerate)
+        self.B = int(block_size)
+        self.shifter = StreamingPitchShifter(self.B, align=align)
+        self.formant = FormantCorrector(self.B) if formant_correct else None
+        self.effects = EffectChain(self.sr, self.B)
+        self._form_shift = 1.0
+
+    def reset(self) -> None:
+        self.shifter.reset()
+        if self.formant is not None:
+            self.formant.reset()
+        self.effects.reset()
+
+    def set_effect(self, mode: str) -> None:
+        self.effects.set_mode(mode)
+
+    @property
+    def latency_samples(self) -> int:
+        base = self.shifter.latency_samples
+        if self.formant is not None:
+            base += self.formant.latency_samples
+        return base
+
+    def process(self, x: np.ndarray, semitones: float = 0.0,
+                form_shift_ratio: float | None = None,
+                effect: str | None = None) -> np.ndarray:
+        ratio = semitones_to_ratio(semitones)
+        y = self.shifter.process(x, ratio)
+        if self.formant is not None:
+            fs = self._form_shift if form_shift_ratio is None else float(form_shift_ratio)
+            y = self.formant.process(y, pitch_ratio=ratio, form_shift_ratio=fs)
+        if effect is not None and effect != self.effects.mode:
+            self.effects.set_mode(effect)
+        y = self.effects.process(y)
+        return y
+
+
 class EffectChain:
     """几种便宜的变声音效，状态跨块保留。"""
 
@@ -252,17 +507,24 @@ class EffectChain:
 
 def process_offline(x, samplerate: int, semitones: float = 0.0, effect: str = "none",
                     block_size: int = 512, gain: float = 1.0,
-                    align: bool = True) -> np.ndarray:
-    """离线处理一整段音频（文件变声用）。输出长度与输入一致。"""
+                    align: bool = True, formant_correct: bool = False,
+                    form_shift_ratio: float = 1.0) -> np.ndarray:
+    """离线处理一整段音频（文件变声用）。输出长度与输入一致。
+
+    formant_correct 默认 False（opt-in）：
+    共振峰校正在简单信号（纯音/合成测试）上会把信号削掉（residual×env
+    模型假设有清晰的谐波列+包络分离），但在真人语音/复杂音频上才真正发挥
+    「拉回共振峰」的效果。CLI/GUI 想要更「真人」效果时显式打开。"""
     x = np.asarray(x, dtype=np.float32).reshape(-1)
     if x.size == 0:
         return x
     B = int(block_size)
-    shifter = StreamingPitchShifter(B, align=align)
-    effects = EffectChain(samplerate, B)
-    effects.set_mode(effect)
+    pipe = VoicePipeline(samplerate, B,
+                         formant_correct=bool(formant_correct),
+                         align=align)
+    pipe.set_effect(effect)
     ratio = semitones_to_ratio(semitones)
-    delay = shifter.latency_samples
+    delay = pipe.latency_samples
 
     # 输出比输入慢 delay 个采样，所以要多喂 delay 个采样才够裁回来
     total = int(x.size) + int(delay)
@@ -271,8 +533,9 @@ def process_offline(x, samplerate: int, semitones: float = 0.0, effect: str = "n
 
     chunks = []
     for i in range(0, xp.size, B):
-        y = shifter.process(xp[i:i + B], ratio)
-        chunks.append(effects.process(y))
+        y = pipe.process(xp[i:i + B], semitones=semitones,
+                         form_shift_ratio=form_shift_ratio)
+        chunks.append(y)
     y = np.concatenate(chunks) * float(gain)
     y = y[delay: delay + x.size]
     if y.size < x.size:

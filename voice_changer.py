@@ -165,27 +165,25 @@ def load_audio(path: str):
 
 # ------------------------------------------------------------------ 界面
 class VoiceChangerApp:
+    # 实时预设：复用 voice_core.VOICE_PRESETS（semitones, form_shift_ratio, effect）
+    # 把 (semitones, form_shift) 解开给滑块。
     PRESETS = [
-        ("原声", 0.0, "none"),
-        ("女生", 4.0, "none"),
-        ("萝莉", 8.0, "none"),
-        ("大叔", -5.0, "none"),
-        ("怪兽", -7.0, "robot"),
-        ("机器人", 0.0, "robot"),
-        ("回声", 0.0, "echo"),
-        ("电话音", 0.0, "phone"),
+        (name, semi, fs, eff)
+        for (name, semi, fs, eff) in vc.VOICE_PRESETS
     ]
 
     def __init__(self, root):
         self.root = root
         root.title("简单变声器 · 实时麦克风变声")
-        root.geometry("680x580")
-        root.minsize(640, 540)
+        root.geometry("720x680")
+        root.minsize(680, 640)
 
         # --- 音频线程只读这些裸属性（避免跨线程访问 tk 变量）---
-        self._ratio = 1.0
+        self._semitones = 0.0
+        self._form_shift = 1.0
         self._gain = 1.0
         self._effect = "none"
+        self._formant_on = True
         self._rec_on = False
         self._rec_blocks = []
         self._rec_samples = 0
@@ -195,8 +193,7 @@ class VoiceChangerApp:
         self._error = None
 
         self.stream = None
-        self.shifter = None
-        self.effects = None
+        self.pipeline = None
         self.samplerate = 48000
         self.blocksize = 512
         self.recording = False
@@ -229,20 +226,35 @@ class VoiceChangerApp:
         box.columnconfigure(1, weight=1)
 
         # 音调
-        pitch = ttk.LabelFrame(wrap, text=" 音调 ")
+        pitch = ttk.LabelFrame(wrap, text=" 音调 · 共振峰（v0.2 起新增） ")
         pitch.pack(fill="x", padx=10, pady=5)
+        ttk.Label(pitch, text="半音").grid(row=0, column=0, sticky="w", padx=8, pady=6)
         self.semi_var = tk.DoubleVar(value=0.0)
         ttk.Scale(pitch, from_=-12, to=12, variable=self.semi_var, orient="horizontal",
-                  command=self.on_semi).grid(row=0, column=0, sticky="we", padx=8, pady=6)
+                  command=self.on_semi).grid(row=0, column=1, sticky="we", padx=6, pady=6)
         self.semi_label = ttk.Label(pitch, text="+0.0 半音 (1.00x)", width=18, anchor="w")
-        self.semi_label.grid(row=0, column=1, padx=6)
-        pitch.columnconfigure(0, weight=1)
+        self.semi_label.grid(row=0, column=2, padx=6)
+
+        ttk.Label(pitch, text="共振峰位移").grid(row=1, column=0, sticky="w", padx=8, pady=6)
+        self.form_var = tk.DoubleVar(value=1.0)
+        ttk.Scale(pitch, from_=0.70, to=1.30, variable=self.form_var, orient="horizontal",
+                  command=self.on_form).grid(row=1, column=1, sticky="we", padx=6, pady=6)
+        self.form_label = ttk.Label(pitch, text="1.00x（原声）", width=18, anchor="w")
+        self.form_label.grid(row=1, column=2, padx=6)
+        pitch.columnconfigure(1, weight=1)
+
+        # 共振峰校正开关：复杂信号（真人）才打开；纯音/合成信号开了反而会糊
+        self.formant_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(pitch, text="启用共振峰校正（让升/降调后的声音更像真人）",
+                        variable=self.formant_var, command=self.on_formant_toggle
+                        ).grid(row=2, column=0, columnspan=3, sticky="w", padx=8, pady=(0, 6))
 
         preset = ttk.Frame(pitch)
-        preset.grid(row=1, column=0, columnspan=2, sticky="w", padx=6, pady=(0, 8))
-        for name, semi, eff in self.PRESETS:
+        preset.grid(row=3, column=0, columnspan=3, sticky="w", padx=6, pady=(0, 8))
+        for name, semi, fs, eff in self.PRESETS:
             ttk.Button(preset, text=name, width=7,
-                       command=lambda s=semi, e=eff, n=name: self.apply_preset(n, s, e)
+                       command=lambda s=semi, f=fs, e=eff, n=name:
+                       self.apply_preset(n, s, f, e)
                        ).pack(side="left", padx=2)
 
         # 音效 / 音量 / 参数
@@ -338,9 +350,27 @@ class VoiceChangerApp:
     # -------------------------------------------------------------- 参数
     def on_semi(self, _=None):
         semi = float(self.semi_var.get())
+        self._semitones = semi
         ratio = vc.semitones_to_ratio(semi)
-        self._ratio = ratio
         self.semi_label.config(text=f"{semi:+.1f} 半音 ({ratio:.2f}x)")
+
+    def on_form(self, _=None):
+        fs = float(self.form_var.get())
+        self._form_shift = fs
+        if abs(fs - 1.0) < 0.005:
+            txt = "1.00x（原声）"
+        elif fs > 1.0:
+            txt = f"{fs:.2f}x（更亮/偏女）"
+        else:
+            txt = f"{fs:.2f}x（更沉/偏男）"
+        self.form_label.config(text=txt)
+
+    def on_formant_toggle(self):
+        self._formant_on = bool(self.formant_var.get())
+        # 如果流已开，重建 pipeline 让状态生效
+        if self.pipeline is not None:
+            self.pipeline = None  # 标记失效，_process_block 会重建
+        self.status.set("共振峰校正：" + ("开" if self._formant_on else "关"))
 
     def on_gain(self, _=None):
         g = float(self.gain_var.get())
@@ -354,12 +384,14 @@ class VoiceChangerApp:
                 self._effect = key
                 break
 
-    def apply_preset(self, name, semi, effect):
+    def apply_preset(self, name, semi, form_shift, effect):
         self.semi_var.set(semi)
         self.on_semi()
+        self.form_var.set(form_shift)
+        self.on_form()
         self.effect_var.set(vc.EFFECT_LABELS[effect])
         self.on_effect()
-        self.status.set(f"已套用预设：{name}")
+        self.status.set(f"已套用预设：{name}（{semi:+.0f} 半音, 共振峰 ×{form_shift:.2f}）")
 
     # -------------------------------------------------------------- 启停
     def toggle(self):
@@ -392,11 +424,12 @@ class VoiceChangerApp:
         note = ""
         for sr in candidates_sr:
             for chans in ((1, 1), (2, 2)):
-                shifter = vc.StreamingPitchShifter(self.blocksize)
-                effects = vc.EffectChain(sr, self.blocksize)
-                effects.set_mode(self._effect)
+                pipeline = vc.VoicePipeline(sr, self.blocksize,
+                                            formant_correct=self._formant_on,
+                                            align=True)
+                pipeline.set_effect(self._effect)
                 # 先把状态挂上再开流：回调可能在 start() 里就跑起来
-                self.shifter, self.effects = shifter, effects
+                self.pipeline = pipeline
                 stream = None
                 for maker in ("duplex", "split"):
                     try:
@@ -428,13 +461,13 @@ class VoiceChangerApp:
                 self._xruns = 0
                 self._rec_blocks = []
                 self._rec_samples = 0
-                latency_ms = (shifter.latency_samples + 2 * self.blocksize) / sr * 1000.0
+                latency_ms = (pipeline.latency_samples + 2 * self.blocksize) / sr * 1000.0
                 self.start_btn.config(text="■ 停止")
                 self.status.set(f"运行中：{sr} Hz ｜ 块 {self.blocksize} ｜ 声道 {chans} ｜ "
                                 f"算法延迟 ≈ {latency_ms:.0f} ms"
                                 f"（叠加系统缓冲通常再多 20~40 ms）{note}")
                 return
-        self.shifter = self.effects = self.stream = None
+        self.pipeline = self.stream = None
         messagebox.showerror(
             "打不开音频流",
             f"错误：{last_err}\n\n常见原因：\n"
@@ -478,10 +511,15 @@ class VoiceChangerApp:
             if status:
                 self._xruns += 1
             x = indata.mean(axis=1) if indata.ndim > 1 else indata
-            if self.effects.mode != self._effect:
-                self.effects.set_mode(self._effect)
-            y = self.shifter.process(x, self._ratio)
-            y = self.effects.process(y)
+            # 共振峰开关切换会让现有 pipeline 失效：就地重建一次
+            if self.pipeline is None and self.stream is not None:
+                self.pipeline = vc.VoicePipeline(self.samplerate, self.blocksize,
+                                                 formant_correct=self._formant_on,
+                                                 align=True)
+                self.pipeline.set_effect(self._effect)
+            y = self.pipeline.process(x, semitones=self._semitones,
+                                       form_shift_ratio=self._form_shift,
+                                       effect=self._effect)
             if self._gain != 1.0:
                 y = y * self._gain
             y = np.clip(y, -1.0, 1.0)
@@ -592,15 +630,21 @@ def run_cli(argv):
     parser.add_argument("--effect", default="none", choices=list(vc.EFFECTS))
     parser.add_argument("--gain", type=float, default=1.0)
     parser.add_argument("--block", type=int, default=512)
+    parser.add_argument("--formant", action="store_true",
+                        help="启用共振峰校正（让声音更像真人；纯音测试信号不要加）")
+    parser.add_argument("--form-shift", type=float, default=1.0,
+                        help="共振峰位移倍数（1.0=拉回原位, >1=偏女, <1=偏男）")
     args = parser.parse_args(argv)
 
     x, sr = load_audio(args.file)
     y = vc.process_offline(x, sr, semitones=args.semitones, effect=args.effect,
-                           block_size=args.block, gain=args.gain)
+                           block_size=args.block, gain=args.gain,
+                           formant_correct=args.formant,
+                           form_shift_ratio=args.form_shift)
     out = args.out or os.path.splitext(args.file)[0] + "_changed.wav"
     save_wav(out, y, sr)
     print(f"完成：{out}  （{sr} Hz, {y.size / sr:.2f}s, {args.semitones:+.1f} 半音, "
-          f"音效={args.effect}）")
+          f"音效={args.effect}, 共振峰 ×{args.form_shift:.2f}）")
     return 0
 
 
