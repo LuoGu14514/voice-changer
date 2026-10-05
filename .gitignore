@@ -1,4 +1,4 @@
-﻿# Python
+# Python
 .venv/
 __pycache__/
 *.pyc
@@ -18,8 +18,13 @@ Thumbs.db
 # Project-specific: keep source files, drop debug probes and tmp
 _debug_*.py
 _test_*.py
+_test_*.txt
+_smoke_*.py
+_smoke_*.txt
 _run_*.py
 _probe_*.py
 _check_*.py
 _perf_*.py
+_research_*.py
+_research_*.txt
 *.tmp

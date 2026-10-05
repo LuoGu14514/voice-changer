@@ -67,7 +67,8 @@ def user_preset_path():
 
 def load_user_presets(path):
     """读取 JSON 预设文件；损坏或不存在时返回空 dict。
-    schema: {"version":1, "presets":{"名字":{"semitones":..,"form_shift":..,"effect":".."}}}"""
+    schema v1: {"version":1, "presets":{"名字":{"semitones":..,"form_shift":..,"effect":".."}}}
+    schema v2: {"version":1, "presets":{"名字":{"semitones":..,"form_shift":..,"effects_config":{...}}}}"""
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -80,11 +81,18 @@ def load_user_presets(path):
             if not isinstance(cfg, dict):
                 continue
             try:
-                out[name] = {
+                row = {
                     "semitones": float(cfg.get("semitones", 0.0)),
                     "form_shift": float(cfg.get("form_shift", 1.0)),
-                    "effect": str(cfg.get("effect", "none")),
                 }
+                # 新格式：effects_config 是 dict
+                ec = cfg.get("effects_config")
+                if isinstance(ec, dict):
+                    row["effects_config"] = ec
+                else:
+                    # 旧格式：effect 是字符串
+                    row["effect"] = str(cfg.get("effect", "none"))
+                out[name] = row
             except Exception:
                 continue
         return out
@@ -243,6 +251,9 @@ class VoiceChangerApp:
         self._form_shift = 1.0
         self._gain = 1.0
         self._effect = "none"
+        # 新：多效果组合（dict）。预设是 dict 时设这里；预设是 string 时为 None。
+        # _process_block 调用 pipeline.process 时 effects_config 优先于 _effect。
+        self._effects_config: dict | None = None
         self._formant_on = True
         self._rec_on = False
         self._rec_blocks = []
@@ -478,20 +489,36 @@ class VoiceChangerApp:
         self.gain_label.config(text=f"{int(round(g * 100))}%")
 
     def on_effect(self, _=None):
+        """用户手动改 combobox 时同步 _effect 并清掉 _effects_config。"""
         label = self.effect_var.get()
         for key, text in vc.EFFECT_LABELS.items():
             if text == label:
                 self._effect = key
+                self._effects_config = None  # 用户改 combobox → 走 legacy 单效果
                 break
 
     def apply_preset(self, name, semi, form_shift, effect):
+        """套用预设。effect 可以是 str（旧 4 模式）或 dict（新多效果组合）。"""
         self.semi_var.set(semi)
         self.on_semi()
         self.form_var.set(form_shift)
         self.on_form()
-        self.effect_var.set(vc.EFFECT_LABELS[effect])
-        self.on_effect()
-        self.status.set(f"已套用预设：{name}（{semi:+.0f} 半音, 共振峰 ×{form_shift:.2f}）")
+        if isinstance(effect, dict):
+            # 新格式：多效果组合。effect_combobox 仅显示「自定义」，
+            # 实际的 config 走 _effects_config 给音频回调。
+            self._effects_config = effect
+            self.effect_var.set(vc.EFFECT_LABELS["none"])
+            self._effect = "none"
+            n_effects = sum(1 for v in effect.values() if v.get("enabled"))
+            self.status.set(
+                f"已套用预设：{name}（{semi:+.0f} 半音, 共振峰 ×{form_shift:.2f}, "
+                f"{n_effects} 个效果组合）")
+        else:
+            # 旧格式：单效果字符串
+            self._effects_config = None
+            self.effect_var.set(vc.EFFECT_LABELS.get(effect, vc.EFFECT_LABELS["none"]))
+            self._effect = effect if effect in vc.EFFECTS else "none"
+            self.status.set(f"已套用预设：{name}（{semi:+.0f} 半音, 共振峰 ×{form_shift:.2f}）")
 
     # -------------------------------------------------------------- 我的预设
     def _user_preset_names(self):
@@ -507,18 +534,22 @@ class VoiceChangerApp:
         name = name.strip()
         if not name:
             return
-        # 推断当前 effect key
-        label = self.effect_var.get()
-        eff = "none"
-        for key, text in vc.EFFECT_LABELS.items():
-            if text == label:
-                eff = key
-                break
         cfg = {
             "semitones": float(self.semi_var.get()),
             "form_shift": float(self.form_var.get()),
-            "effect": eff,
         }
+        # 如果用户从预设加载了多效果组合，且没手动改 combobox → 存 dict
+        if self._effects_config is not None:
+            cfg["effects_config"] = self._effects_config
+        else:
+            # legacy 单效果
+            label = self.effect_var.get()
+            eff = "none"
+            for key, text in vc.EFFECT_LABELS.items():
+                if text == label:
+                    eff = key
+                    break
+            cfg["effect"] = eff
         self._user_presets[name] = cfg
         try:
             save_user_presets(self._user_preset_path, self._user_presets)
@@ -533,7 +564,9 @@ class VoiceChangerApp:
         if not name or name not in self._user_presets:
             return
         cfg = self._user_presets[name]
-        self.apply_preset(f"我的「{name}」", cfg["semitones"], cfg["form_shift"], cfg["effect"])
+        # 兼容旧 JSON（只有 effect）和新 JSON（有 effects_config）
+        eff = cfg.get("effects_config", cfg.get("effect", "none"))
+        self.apply_preset(f"我的「{name}」", cfg["semitones"], cfg["form_shift"], eff)
 
     def on_delete_user_preset(self):
         name = self.user_combo.get()
@@ -687,9 +720,17 @@ class VoiceChangerApp:
                                                  formant_correct=self._formant_on,
                                                  align=True)
                 self.pipeline.set_effect(self._effect)
-            y = self.pipeline.process(x, semitones=self._semitones,
-                                       form_shift_ratio=self._form_shift,
-                                       effect=self._effect)
+            # 决定走 dict（多效果）还是 str（单效果）：
+            # 有 _effects_config 就用 dict（pipeline.process 会优先用 effects_config）。
+            if self._effects_config is not None:
+                y = self.pipeline.process(x, semitones=self._semitones,
+                                           form_shift_ratio=self._form_shift,
+                                           effect=self._effect,
+                                           effects_config=self._effects_config)
+            else:
+                y = self.pipeline.process(x, semitones=self._semitones,
+                                           form_shift_ratio=self._form_shift,
+                                           effect=self._effect)
             if self._gain != 1.0:
                 y = y * self._gain
             y = np.clip(y, -1.0, 1.0)

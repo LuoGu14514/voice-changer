@@ -8,7 +8,11 @@
    单独使用时跟原声完全相同；接在变调后面能把「音高上去了但共振峰也
    跟着上去了 = 声像变小、变成花栗鼠」这种情况修掉，让升调后的声音
    保持原始的「声道形状」（听起来才像真人女声 / 男声，而不是小孩）。
-3. EffectChain：机器人 / 回声 / 电话音等简单音效。
+3. EffectChain / EffectRack（v0.4.0 起：12+ 效果器 rack）：
+   噪声门 / 机器人 / 气音 / 电话音 / 失真 / 位破坏 / 合唱 / 回声 /
+   混响 / EQ / 压缩器 / 颤音 / 震音 / 呼吸声。多个效果可同时叠加，
+   每个独立控制强度。EffectChain 是向后兼容的简单包装（仅单效果），
+   新代码应直接用 EffectRack。
 
 不依赖 scipy，只需要 numpy。STFT 走的是纯 numpy（np.fft.rfft）。
 """
@@ -16,68 +20,167 @@ from __future__ import annotations
 
 import numpy as np
 
+from effects import (
+    EFFECT_NAMES as _EFFECT_NAMES,
+    EFFECT_LABELS as _EFFECT_LABELS_FROM_EFFECTS,
+    EffectRack,
+    build_effect_rack,
+)
+
 __all__ = [
     "semitones_to_ratio",
     "StreamingPitchShifter",
     "FormantCorrector",
     "VoicePipeline",
     "EffectChain",
+    "EffectRack",
     "process_offline",
     "EFFECTS",
     "EFFECT_LABELS",
     "VOICE_PRESETS",
+    "LEGACY_EFFECT_CONFIGS",
 ]
 
+# 向后兼容：旧的 4 个单效果模式（GUI 里仍能选）
 EFFECTS = ("none", "robot", "echo", "phone")
 EFFECT_LABELS = {"none": "无", "robot": "机器人", "echo": "回声", "phone": "电话音"}
 
-# v0.3.0：合并 GitHub 调研到的预设库，扩到 30 项
-# 字段：(显示名, 半音, 共振峰位移比, 音效, 分组)
-# form_shift 1.0 = 共振峰不动（保留原本声道）；>1 = 变小（儿童/女）；
-#                <1 = 变大（男/大叔）。分组用于 GUI 排版（"原/女/男/童/特效"）。
+# 旧的 effect 名 → 新 rack config（向后兼容用）
+LEGACY_EFFECT_CONFIGS = {
+    "none":  {},
+    "robot": {"robot": {"enabled": True, "hz": 60.0}},
+    "echo":  {"echo":  {"enabled": True, "delay_ms": 130.0, "feedback": 0.35, "mix": 0.45}},
+    "phone": {"telephone": {"enabled": True}},
+}
+
+
+def _normalize_effect_spec(spec) -> dict:
+    """把 preset 的 effect 字段（None/str/dict）归一化为 dict config。
+
+    None 或空 → {}
+    str：旧 "none/robot/echo/phone" → LEGACY_EFFECT_CONFIGS 对应项；其它 → {}
+    dict：原样
+    """
+    if spec is None or spec == "":
+        return {}
+    if isinstance(spec, str):
+        return dict(LEGACY_EFFECT_CONFIGS.get(spec, {}))
+    if isinstance(spec, dict):
+        return spec
+    return {}
+
+# v0.4.0：30 个角色音色 preset，每项用多效果组合（dict config）
+# 字段：(显示名, 半音, 共振峰位移比, 效果 config, 分组)
+# form_shift 1.0 = 共振峰不动；>1 = 变小（儿童/女）；<1 = 变大（男/大叔）。
+# effects 字段支持三种类型：
+#   - str: 旧版单效果名（"none"/"robot"/"echo"/"phone"），自动通过 LEGACY_EFFECT_CONFIGS 转换
+#   - dict: 新版多效果组合 {effect_name: {enabled, ...params}}
+#   - None 或 {}: 无效果
+#
+# 设计原则：
+#   - 同一档内的 preset 共享基础 pitch+formant，仅用 effects 区分个性
+#   - 真人女声：pitch ↑ + form_shift ↑ + 高频略提升 + 微量气声
+#   - 大叔/磁性：pitch ↓ + form_shift ↓ + 低频提升
+#   - 童声：pitch ↑↑ + form_shift ↑↑ + 大量气声
+#   - 恶魔：pitch ↓ + 重失真 + 低频提升
+#   - 兽人/幽灵/外星人：参考 SUONSUN9527 community.json
 #
 # 参考来源：
 #   - suer781/MaidMic           (Apache-2.0, 萝莉默认/大叔/花栗鼠 preset)
 #   - neboyang/VoiceChanger     (Apache-2.0, KITTY/ROSE/WOMAN/UNCLE/MAN/TOM)
 #   - lyrebird-voice-changer    (GPL, 公开 industry baseline: Darth Vader -6 等)
 #   - SUONSUN9527/windows-voice-changer  (community.json: 兽人/幽灵/外星人)
+#   - sioaeko/OpenVoiceChanger  (12 效果器 rack 设计参考)
 #   - 自调（基于听觉微调）
 VOICE_PRESETS = (
     # —— 中性 ——
-    ("原声",     0.0,  1.00, "none",  "原"),
+    ("原声",     0.0,  1.00, {}, "原"),
+
     # —— 女性 ——
-    ("真女声",   3.0,  1.05, "none",  "女"),
-    ("御姐",     4.0,  1.10, "none",  "女"),     # MaidMic 御姐
-    ("萌妹",     6.0,  1.18, "none",  "女"),     # 偏 loud-excited
-    ("嗲嗲",     5.0,  1.20, "none",  "女"),     # MaidMic 默认萌妹 +4/+2 加深
-    ("客服女",   2.0,  1.05, "none",  "女"),
-    ("播音女",   1.0,  1.02, "none",  "女"),
-    ("少妇",     2.0,  0.96, "none",  "女"),
-    ("老奶奶",  -6.0,  0.88, "none",  "女"),
+    # 真女声：基础 pitch 上推 3 半音 + 微量 treble 提亮
+    ("真女声",   3.0,  1.05, {"tone_eq": {"enabled": True, "treble_db": 1.5}}, "女"),
+    # 御姐：成熟女声，低频 + 气声
+    ("御姐",     4.0,  1.10, {"tone_eq": {"enabled": True, "bass_db": 1.0, "treble_db": 1.0},
+                              "breath": {"enabled": True, "strength": 0.15}}, "女"),
+    # 萌妹：可爱感（高频 + 气声）
+    ("萌妹",     6.0,  1.18, {"tone_eq": {"enabled": True, "treble_db": 1.0},
+                              "breath": {"enabled": True, "strength": 0.20}}, "女"),
+    # 嗲嗲：娃娃气 + bass 收一点避免闷
+    ("嗲嗲",     5.0,  1.20, {"tone_eq": {"enabled": True, "bass_db": -2.0, "treble_db": 2.0},
+                              "breath": {"enabled": True, "strength": 0.30}}, "女"),
+    # 客服女：温和压缩，听感稳定
+    ("客服女",   2.0,  1.05, {"compressor": {"enabled": True, "threshold_db": -20.0, "ratio": 3.0}}, "女"),
+    # 播音女：广播感压缩 + 提亮
+    ("播音女",   1.0,  1.02, {"compressor": {"enabled": True, "threshold_db": -18.0, "ratio": 4.0},
+                              "tone_eq": {"enabled": True, "bass_db": -1.0, "treble_db": 2.0}}, "女"),
+    # 少妇：成熟女声 + 一点点房间混响
+    ("少妇",     2.0,  0.96, {"tone_eq": {"enabled": True, "bass_db": 1.0},
+                              "reverb": {"enabled": True, "mix": 0.2}}, "女"),
+    # 老奶奶：老声 + 慢震音（手抖）+ 混响
+    ("老奶奶",  -6.0,  0.88, {"tone_eq": {"enabled": True, "bass_db": -2.0},
+                              "vibrato": {"enabled": True, "hz": 4.0},
+                              "reverb": {"enabled": True, "mix": 0.3}}, "女"),
+
     # —— 男性 ——
-    ("真男声",  -3.0,  0.95, "none",  "男"),
-    ("大叔",    -5.0,  0.90, "none",  "男"),     # MaidMic deep_uncle -5/-3
-    ("恶魔",    -6.0,  0.85, "none",  "男"),     # lyrebird Darth Vader
-    ("磁性男",  -2.0,  0.92, "none",  "男"),
-    ("客服男",  -1.0,  0.95, "none",  "男"),
-    ("播音男",   0.0,  0.97, "none",  "男"),
-    ("老人",    -7.0,  0.85, "none",  "男"),
+    ("真男声",  -3.0,  0.95, {"tone_eq": {"enabled": True, "bass_db": 1.0}}, "男"),
+    # 大叔：低频 + 呼吸感
+    ("大叔",    -5.0,  0.90, {"tone_eq": {"enabled": True, "bass_db": 2.0},
+                              "breath": {"enabled": True, "strength": 0.10}}, "男"),
+    # 恶魔：重失真 + 低频
+    ("恶魔",    -6.0,  0.85, {"distortion": {"enabled": True, "drive": 1.5, "mix": 1.0},
+                              "tone_eq": {"enabled": True, "bass_db": 3.0}}, "男"),
+    # 磁性男：低频 + 温和压缩
+    ("磁性男",  -2.0,  0.92, {"tone_eq": {"enabled": True, "bass_db": 1.0},
+                              "compressor": {"enabled": True, "threshold_db": -18.0, "ratio": 2.5}}, "男"),
+    # 客服男：压缩
+    ("客服男",  -1.0,  0.95, {"compressor": {"enabled": True, "threshold_db": -20.0, "ratio": 3.0}}, "男"),
+    # 播音男：广播压缩 + EQ
+    ("播音男",   0.0,  0.97, {"compressor": {"enabled": True, "threshold_db": -18.0, "ratio": 4.0},
+                              "tone_eq": {"enabled": True, "bass_db": -1.0, "treble_db": 2.0}}, "男"),
+    # 老人：低频 + 混响 + 压缩
+    ("老人",    -7.0,  0.85, {"tone_eq": {"enabled": True, "bass_db": 3.0},
+                              "reverb": {"enabled": True, "mix": 0.2},
+                              "compressor": {"enabled": True, "threshold_db": -25.0, "ratio": 2.0}}, "男"),
+
     # —— 童声 ——
-    ("萝莉",     7.0,  1.18, "none",  "童"),     # MaidMic chipmunk +7/+3
-    ("正太",     5.0,  1.10, "none",  "童"),
-    ("小孩",     9.0,  1.20, "none",  "童"),
-    ("娃娃音",  12.0,  1.20, "none",  "童"),     # neboyang ROSE +12.8
-    ("小猫",     4.0,  1.15, "none",  "童"),     # neboyang KITTY
-    ("花栗鼠",   7.0,  1.20, "none",  "童"),     # MaidMic chipmunk
-    ("汤姆猫",  10.0,  1.18, "none",  "童"),     # neboyang TOM
+    # 萝莉：基础 + 较多气声
+    ("萝莉",     7.0,  1.18, {"breath": {"enabled": True, "strength": 0.30}}, "童"),
+    ("正太",     5.0,  1.10, {"breath": {"enabled": True, "strength": 0.20}}, "童"),
+    # 小孩：高 pitch + 大量气声 + 高频提亮
+    ("小孩",     9.0,  1.20, {"tone_eq": {"enabled": True, "treble_db": 1.0},
+                              "breath": {"enabled": True, "strength": 0.40}}, "童"),
+    # 娃娃音：极高 pitch + 合唱 + 大量气声
+    ("娃娃音",  12.0,  1.20, {"chorus": {"enabled": True},
+                              "breath": {"enabled": True, "strength": 0.50}}, "童"),
+    # 小猫：卡通
+    ("小猫",     4.0,  1.15, {"breath": {"enabled": True, "strength": 0.30}}, "童"),
+    # 花栗鼠：bitcrush + 气声
+    ("花栗鼠",   7.0,  1.20, {"bitcrush": {"enabled": True, "strength": 0.3},
+                              "breath": {"enabled": True, "strength": 0.40}}, "童"),
+    # 汤姆猫：高 pitch + 轻 bitcrush
+    ("汤姆猫",  10.0,  1.18, {"bitcrush": {"enabled": True, "strength": 0.2},
+                              "breath": {"enabled": True, "strength": 0.40}}, "童"),
+
     # —— 特效 ——
-    ("机器人",    0.0,  1.00, "robot",  "特效"),
-    ("电音女王",  4.0,  1.10, "robot",  "特效"),
-    ("外星人",   2.0,  1.10, "robot",  "特效"),  # SUONSUN9527 alien
-    ("兽人",    -5.0,  0.85, "echo",   "特效"),  # SUONSUN9527 orc
-    ("幽灵",    -2.0,  0.95, "echo",   "特效"),  # SUONSUN9527 ghost
-    ("回声",     0.0,  1.00, "echo",   "特效"),
-    ("电话音",   0.0,  1.00, "phone",  "特效"),
+    ("机器人",    0.0,  1.00, {"robot": {"enabled": True, "hz": 60.0}}, "特效"),
+    # 电音女王：基础 robot + 合唱
+    ("电音女王",  4.0,  1.10, {"robot": {"enabled": True, "hz": 60.0},
+                              "chorus": {"enabled": True}}, "特效"),
+    # 外星人：高 hz robot + 混响（SUONSUN9527 alien）
+    ("外星人",   2.0,  1.10, {"robot": {"enabled": True, "hz": 200.0},
+                              "reverb": {"enabled": True, "mix": 0.3}}, "特效"),
+    # 兽人：低频 + 短回声 + 失真（SUONSUN9527 orc）
+    ("兽人",    -5.0,  0.85, {"echo": {"enabled": True, "delay_ms": 40.0, "feedback": 0.06, "mix": 0.5},
+                              "tone_eq": {"enabled": True, "bass_db": 3.0},
+                              "distortion": {"enabled": True, "drive": 1.2, "mix": 0.3}}, "特效"),
+    # 幽灵：长回声 + 混响 + 合唱（SUONSUN9527 ghost）
+    ("幽灵",    -2.0,  0.95, {"echo": {"enabled": True, "delay_ms": 350.0, "feedback": 0.35, "mix": 0.65},
+                              "reverb": {"enabled": True, "mix": 0.4},
+                              "chorus": {"enabled": True}}, "特效"),
+    # 回声：标准 echo
+    ("回声",     0.0,  1.00, {"echo": {"enabled": True, "delay_ms": 250.0, "feedback": 0.3, "mix": 0.45}}, "特效"),
+    # 电话音：标准 telephone
+    ("电话音",   0.0,  1.00, {"telephone": {"enabled": True}}, "特效"),
 )
 
 
@@ -417,7 +520,11 @@ class VoicePipeline:
 
     用法：
         pipe = VoicePipeline(sr=48000, block_size=512)
-        y = pipe.process(x_mic, semitones=3.0, form_shift_ratio=1.0, effect="none")
+        # 旧 API（向后兼容）：effect = "robot" 等单字符串
+        y = pipe.process(x_mic, semitones=3.0, form_shift_ratio=1.0, effect="robot")
+        # 新 API：effects_config = {"robot": {"enabled": True, "hz": 80}}
+        y = pipe.process(x_mic, semitones=3.0, form_shift_ratio=1.0,
+                         effects_config={"robot": {"enabled": True, "hz": 80}})
     """
 
     def __init__(self, samplerate: int = 48000, block_size: int = 512,
@@ -426,17 +533,26 @@ class VoicePipeline:
         self.B = int(block_size)
         self.shifter = StreamingPitchShifter(self.B, align=align)
         self.formant = FormantCorrector(self.B) if formant_correct else None
-        self.effects = EffectChain(self.sr, self.B)
+        # 直接用 EffectRack（不走 EffectChain 包装）以支持多效果组合
+        self.effects = EffectRack(self.sr, self.B)
         self._form_shift = 1.0
+        self._current_config: dict = {}
 
     def reset(self) -> None:
         self.shifter.reset()
         if self.formant is not None:
             self.formant.reset()
         self.effects.reset()
+        self._current_config = {}
 
     def set_effect(self, mode: str) -> None:
-        self.effects.set_mode(mode)
+        """旧式 set_mode 入口（仅供 GUI 旧的下拉框用）。"""
+        mode = mode if mode in EFFECTS else "none"
+        self._current_config = LEGACY_EFFECT_CONFIGS[mode]
+
+    def set_effects_config(self, config: dict | None) -> None:
+        """新式入口：直接指定多效果 dict config。"""
+        self._current_config = _normalize_effect_spec(config)
 
     @property
     def latency_samples(self) -> int:
@@ -447,103 +563,81 @@ class VoicePipeline:
 
     def process(self, x: np.ndarray, semitones: float = 0.0,
                 form_shift_ratio: float | None = None,
-                effect: str | None = None) -> np.ndarray:
+                effect: str | None = None,
+                effects_config: dict | None = None) -> np.ndarray:
+        """处理一个 B 块。
+
+        effect 与 effects_config 二选一：
+          - 给 effect（str）：用 LEGACY_EFFECT_CONFIGS 转换
+          - 给 effects_config（dict）：直接作为当前效果链
+        """
         ratio = semitones_to_ratio(semitones)
         y = self.shifter.process(x, ratio)
         if self.formant is not None:
             fs = self._form_shift if form_shift_ratio is None else float(form_shift_ratio)
             y = self.formant.process(y, pitch_ratio=ratio, form_shift_ratio=fs)
-        if effect is not None and effect != self.effects.mode:
-            self.effects.set_mode(effect)
-        y = self.effects.process(y)
+        # 决定当前 config
+        if effects_config is not None:
+            cfg = _normalize_effect_spec(effects_config)
+        elif effect is not None:
+            mode = effect if effect in EFFECTS else "none"
+            cfg = LEGACY_EFFECT_CONFIGS[mode]
+        else:
+            cfg = self._current_config
+        if cfg:
+            y = self.effects.process(y, cfg)
         return y
 
 
 class EffectChain:
-    """几种便宜的变声音效，状态跨块保留。"""
+    """向后兼容的简单 wrapper —— 内部用 EffectRack，只暴露「单效果模式」。
+
+    新代码应直接用 `from voice_core import EffectRack`（或 `from effects import
+    EffectRack`），传入完整的 dict config。同时启用多个效果、自定义参数。
+    """
 
     def __init__(self, samplerate: int = 48000, block_size: int = 512,
                  echo_ms: float = 130.0, echo_feedback: float = 0.35,
                  echo_mix: float = 0.45, ringmod_hz: float = 60.0,
                  phone_lo: float = 400.0, phone_hi: float = 3000.0, phone_taps: int = 201):
+        # 旧版参数保留接口但不再使用（保持向后兼容签名）
         self.sr = int(samplerate)
         self.B = int(block_size)
-        self.mode = "none"
         self.echo_ms = float(echo_ms)
         self.echo_feedback = float(echo_feedback)
         self.echo_mix = float(echo_mix)
         self.ringmod_hz = float(ringmod_hz)
         self.phone_lo, self.phone_hi = float(phone_lo), float(phone_hi)
         self.phone_taps = int(phone_taps)
-        self._h = self._design_bandpass()
-        self.reset()
-
-    # ---------------------------------------------------------------- 内部
-    def _design_bandpass(self) -> np.ndarray:
-        """加窗 sinc 带通 FIR，通带增益归一化到 1。"""
-        taps = self.phone_taps
-        n = np.arange(taps) - (taps - 1) / 2.0
-        f1, f2 = self.phone_lo / self.sr, self.phone_hi / self.sr
-        h = 2.0 * f2 * np.sinc(2.0 * f2 * n) - 2.0 * f1 * np.sinc(2.0 * f1 * n)
-        h *= np.hamming(taps)
-        f0 = np.sqrt(self.phone_lo * self.phone_hi)
-        w = np.exp(-2j * np.pi * f0 / self.sr * np.arange(taps))
-        gain = abs(np.dot(h, w))
-        if gain > 0:
-            h = h / gain
-        return h.astype(np.float32)
+        # 真正的 DSP 在 EffectRack 里
+        self._rack = EffectRack(self.sr, self.B)
+        self._config = {}
+        self.mode = "none"
 
     def reset(self) -> None:
-        self._phase = 0.0
-        d = max(1, int(self.sr * self.echo_ms / 1000.0))
-        self._delay = np.zeros(d, dtype=np.float32)
-        self._dp = 0
-        self._tail = np.zeros(max(0, self.phone_taps - 1), dtype=np.float32)
+        self._rack.reset()
 
     def set_mode(self, mode: str) -> None:
         mode = mode if mode in EFFECTS else "none"
-        if mode != self.mode:
-            self.mode = mode
-            self.reset()
+        self.mode = mode
+        self._config = LEGACY_EFFECT_CONFIGS[mode]
 
-    # ---------------------------------------------------------------- 处理
     def process(self, x: np.ndarray) -> np.ndarray:
-        x = np.asarray(x, dtype=np.float32).reshape(-1)
-        m = self.mode
-        if m == "none" or x.size == 0:
-            return x
-        if m == "robot":
-            inc = 2.0 * np.pi * self.ringmod_hz / self.sr
-            ph = self._phase + inc * np.arange(x.size)
-            self._phase = float((self._phase + inc * x.size) % (2.0 * np.pi))
-            return (x * np.sin(ph)).astype(np.float32)
-        if m == "echo":
-            d = self._delay.size
-            out = np.empty_like(x)
-            for i in range(x.size):
-                v = self._delay[self._dp]
-                out[i] = x[i] + self.echo_mix * v
-                self._delay[self._dp] = np.float32(x[i] + self.echo_feedback * v)
-                self._dp += 1
-                if self._dp >= d:
-                    self._dp = 0
-            return out
-        if m == "phone":
-            full = np.convolve(x, self._h)
-            out = full[: x.size].copy()
-            if self._tail.size:
-                out[: self._tail.size] += self._tail
-            self._tail = full[x.size:].astype(np.float32)
-            # 一点点过载，更像电话/对讲机
-            return (np.tanh(out * 1.6) * 0.9).astype(np.float32)
-        return x
+        return self._rack.process(x, self._config)
 
 
 def process_offline(x, samplerate: int, semitones: float = 0.0, effect: str = "none",
                     block_size: int = 512, gain: float = 1.0,
                     align: bool = True, formant_correct: bool = False,
-                    form_shift_ratio: float = 1.0) -> np.ndarray:
+                    form_shift_ratio: float = 1.0,
+                    effects_config: dict | None = None) -> np.ndarray:
     """离线处理一整段音频（文件变声用）。输出长度与输入一致。
+
+    effect / effects_config：
+      - 默认 "none"（向后兼容）
+      - str 旧 API："none"/"robot"/"echo"/"phone"
+      - dict 新 API：{"robot": {"enabled": True, "hz": 80}} 多效果组合
+      - effects_config 优先于 effect（如果两者都给）
 
     formant_correct 默认 False（opt-in）：
     共振峰校正在简单信号（纯音/合成测试）上会把信号削掉（residual×env
@@ -556,9 +650,16 @@ def process_offline(x, samplerate: int, semitones: float = 0.0, effect: str = "n
     pipe = VoicePipeline(samplerate, B,
                          formant_correct=bool(formant_correct),
                          align=align)
-    pipe.set_effect(effect)
     ratio = semitones_to_ratio(semitones)
     delay = pipe.latency_samples
+
+    # 决定 cfg（effects_config 优先）
+    if effects_config is not None:
+        cfg = _normalize_effect_spec(effects_config)
+    elif isinstance(effect, str):
+        cfg = LEGACY_EFFECT_CONFIGS.get(effect, {})
+    else:
+        cfg = {}
 
     # 输出比输入慢 delay 个采样，所以要多喂 delay 个采样才够裁回来
     total = int(x.size) + int(delay)
@@ -568,7 +669,8 @@ def process_offline(x, samplerate: int, semitones: float = 0.0, effect: str = "n
     chunks = []
     for i in range(0, xp.size, B):
         y = pipe.process(xp[i:i + B], semitones=semitones,
-                         form_shift_ratio=form_shift_ratio)
+                         form_shift_ratio=form_shift_ratio,
+                         effects_config=cfg)
         chunks.append(y)
     y = np.concatenate(chunks) * float(gain)
     y = y[delay: delay + x.size]

@@ -1,6 +1,6 @@
 # 简单变声器（实时麦克风变声）
 
-一个只用 Python + numpy 写的实时变声小工具：**变调**（±12 半音）+ **共振峰校正** + 4 种音效，图形界面开箱即用。
+一个只用 Python + numpy 写的实时变声小工具：**变调**（±12 半音）+ **共振峰校正** + **15 种效果器可任意组合**，图形界面开箱即用。
 算法是自写的「颗粒重叠相加 + WSOLA 相位对齐 + 谱包络分离」，不依赖任何音频处理库。
 
 ```
@@ -49,6 +49,47 @@ requirements.txt   numpy / sounddevice / soundfile
 变调部分用的是颗粒重叠相加，声音会带一点「金属感/电子感」，这是这类算法（包括大多数开源变声器）的固有特点，
 不是配置问题；块大小取 1024 会更平滑，代价是延迟更大。
 
+### v0.4 新增：15 种效果器可任意组合（总开销 < 4ms/块）
+
+v0.4 起内置一个 15 效果器 rack（参考 sioaeko/OpenVoiceChanger 设计），可以同时启用多个、独立调强度：
+
+```
+降噪门 / 机器人(环形调制) / 气音 / 电话音 / 失真 / 位破坏 / 合唱 / 回声 /
+混响 / 音色 EQ（3 段）/ 压缩器 / 颤音 / 震音 / 呼吸声 / 静音节能
+```
+
+GUI 顶部「预设」按钮已预置了 30 个角色，每个都用具体的多效果组合（见下方「预设一览」表）。
+如果你想完全自定义，可以在代码里这样调用：
+
+```python
+import voice_core as vc
+import numpy as np
+
+sr, B = 48000, 512
+pipe = vc.VoicePipeline(sr, B, formant_correct=True)
+
+# 例：自制「机器人 + 一点点回声 + 低音 +3dB」
+cfg = {
+    "robot":      {"enabled": True, "hz": 80},
+    "echo":       {"enabled": True, "delay_ms": 130, "feedback": 0.35, "mix": 0.45},
+    "tone_eq":    {"enabled": True, "bass_db": 3.0},
+}
+
+x = np.random.randn(B).astype(np.float32) * 0.3
+y = pipe.process(x, semitones=3.0, form_shift_ratio=1.05,
+                 effects_config=cfg)
+```
+
+或者离线处理整个文件：
+
+```python
+import soundfile as sf, voice_core as vc
+x, sr = sf.read("in.wav", framing="float32")
+y = vc.process_offline(x, sr, semitones=3.0, form_shift_ratio=1.05,
+                       formant_correct=True, effects_config=cfg)
+sf.write("out.wav", y, sr)
+```
+
 ## 三、在游戏 / QQ / 微信里用（虚拟声卡）
 
 你机器上已经装了 **VB-Audio Virtual Cable**（VB-CABLE），所以不用再装东西：
@@ -78,52 +119,57 @@ requirements.txt   numpy / sounddevice / soundfile
 
 声音处理全部在本机完成，不联网、不录音上传。
 
-## 预设一览（v0.3.0 起共 30 项）
+## 预设一览（v0.4.0 起共 30 项，30 个全部带多效果组合）
 
-按分组显示，每项写明半音数和共振峰位移比。**共振峰位移比 >1** = 嘴更小（女声/儿童），**<1** = 嘴更大（男声/大叔）。
+按分组显示，每项写明半音数、共振峰位移比、效果组合。**共振峰位移比 >1** = 嘴更小（女声/儿童），**<1** = 嘴更大（男声/大叔）。
 
-| 分组 | 预设 | 半音 | 共振峰 | 音效 | 参考 |
-|---|---|---:|---:|---|---|
-| 原声 | 原声 | 0 | 1.00 | 无 | — |
-| 女性 | 真女声 | +3 | 1.05 | 无 | — |
-|  | 御姐 | +4 | 1.10 | 无 | MaidMic |
-|  | 萌妹 | +6 | 1.18 | 无 | 自调 |
-|  | 嗲嗲 | +5 | 1.20 | 无 | MaidMic |
-|  | 客服女 | +2 | 1.05 | 无 | — |
-|  | 播音女 | +1 | 1.02 | 无 | — |
-|  | 少妇 | +2 | 0.96 | 无 | — |
-|  | 老奶奶 | −6 | 0.88 | 无 | — |
-| 男性 | 真男声 | −3 | 0.95 | 无 | — |
-|  | 大叔 | −5 | 0.90 | 无 | MaidMic deep_uncle |
-|  | 恶魔 | −6 | 0.85 | 无 | lyrebird Darth Vader |
-|  | 磁性男 | −2 | 0.92 | 无 | — |
-|  | 客服男 | −1 | 0.95 | 无 | — |
-|  | 播音男 | 0 | 0.97 | 无 | — |
-|  | 老人 | −7 | 0.85 | 无 | — |
-| 童声 | 萝莉 | +7 | 1.18 | 无 | MaidMic chipmunk |
-|  | 正太 | +5 | 1.10 | 无 | — |
-|  | 小孩 | +9 | 1.20 | 无 | — |
-|  | 娃娃音 | +12 | 1.20 | 无 | neboyang ROSE +12.8 |
-|  | 小猫 | +4 | 1.15 | 无 | neboyang KITTY |
-|  | 花栗鼠 | +7 | 1.20 | 无 | MaidMic chipmunk |
-|  | 汤姆猫 | +10 | 1.18 | 无 | neboyang TOM |
-| 特效 | 机器人 | 0 | 1.00 | robot | — |
-|  | 电音女王 | +4 | 1.10 | robot | — |
-|  | 外星人 | +2 | 1.10 | robot | SUONSUN9527 alien |
-|  | 兽人 | −5 | 0.85 | echo | SUONSUN9527 orc |
-|  | 幽灵 | −2 | 0.95 | echo | SUONSUN9527 ghost |
-|  | 回声 | 0 | 1.00 | echo | — |
-|  | 电话音 | 0 | 1.00 | phone | — |
+v0.4 起每个预设都预设了具体的效果组合，让声音更像真角色，而不是单调的「升降调+单效果」。
+
+| 分组 | 预设 | 半音 | 共振峰 | 效果组合 |
+|---|---|---:|---:|---|
+| 原声 | 原声 | 0 | 1.00 | — |
+| 女性 | 真女声 | +3 | 1.05 | 高频 +1.5dB |
+|  | 御姐 | +4 | 1.10 | 0.15 气声 + EQ 低/高频各 +1dB |
+|  | 萌妹 | +6 | 1.18 | 0.20 气声 + 高频 +1dB |
+|  | 嗲嗲 | +5 | 1.20 | 0.30 气声 + 低-2dB 高+2dB |
+|  | 客服女 | +2 | 1.05 | 压缩（-20dB / 3:1） |
+|  | 播音女 | +1 | 1.02 | 压缩（-18dB / 4:1）+ EQ |
+|  | 少妇 | +2 | 0.96 | 0.2 混响 + 低+1dB |
+|  | 老奶奶 | −6 | 0.88 | 4Hz 震音 + 0.3 混响 + 低-2dB |
+| 男性 | 真男声 | −3 | 0.95 | 低+1dB |
+|  | 大叔 | −5 | 0.90 | 低+2dB + 0.10 气声 |
+|  | 恶魔 | −6 | 0.85 | 失真 drive 1.5 + 低+3dB |
+|  | 磁性男 | −2 | 0.92 | 低+1dB + 压缩（-18dB / 2.5:1） |
+|  | 客服男 | −1 | 0.95 | 压缩（-20dB / 3:1） |
+|  | 播音男 | 0 | 0.97 | 压缩（-18dB / 4:1）+ EQ |
+|  | 老人 | −7 | 0.85 | 低+3dB + 0.2 混响 + 压缩 |
+| 童声 | 萝莉 | +7 | 1.18 | 0.30 气声 |
+|  | 正太 | +5 | 1.10 | 0.20 气声 |
+|  | 小孩 | +9 | 1.20 | 0.40 气声 + 高频 +1dB |
+|  | 娃娃音 | +12 | 1.20 | 合唱 + 0.50 气声 |
+|  | 小猫 | +4 | 1.15 | 0.30 气声 |
+|  | 花栗鼠 | +7 | 1.20 | 位破坏 0.3 + 0.40 气声 |
+|  | 汤姆猫 | +10 | 1.18 | 位破坏 0.2 + 0.40 气声 |
+| 特效 | 机器人 | 0 | 1.00 | robot 60Hz |
+|  | 电音女王 | +4 | 1.10 | robot 60Hz + 合唱 |
+|  | 外星人 | +2 | 1.10 | robot 200Hz + 0.3 混响 |
+|  | 兽人 | −5 | 0.85 | 40ms 短回声 + 低+3dB + 失真 |
+|  | 幽灵 | −2 | 0.95 | 350ms 长回声 + 0.4 混响 + 合唱 |
+|  | 回声 | 0 | 1.00 | 250ms echo |
+|  | 电话音 | 0 | 1.00 | telephone 带通 |
+
+可用的效果（`voice_core.EFFECT_NAMES`）：`noise_gate robot whisper telephone distortion bitcrush chorus echo reverb tone_eq compressor output_gain tremolo vibrato breath silence_saver`。
 
 **参考来源**（数据来自 GitHub 公开项目；本项目只 port 数值表，不复制源码）：
 - [suer781/MaidMic](https://github.com/suer781/MaidMic) — 萝莉/大叔/花栗鼠（Apache-2.0）
 - [neboyang/VoiceChanger](https://github.com/neboyang/VoiceChanger) — KITTY/ROSE/WOMAN/UNCLE/MAN/TOM（Apache-2.0）
 - [lyrebird-voice-changer/lyrebird](https://github.com/lyrebird-voice-changer/lyrebird) — Darth Vader 等行业基线
 - [SUONSUN9527/windows-voice-changer](https://github.com/SUONSUN9527/windows-voice-changer) — 兽人/幽灵/外星人
+- [sioaeko/OpenVoiceChanger](https://github.com/sioaeko/OpenVoiceChanger) — 16 效果器 rack 设计参考（MIT）
 
 ## 五、自测
 
-不接声卡也能验证 DSP（46 项检查：恒等直通、音准、时长、音效、无 NaN/削波、共振峰校正、VoicePipeline 跑通）：
+不接声卡也能验证 DSP（74 项检查：恒等直通、音准、时长、音效、无 NaN/削波、共振峰校正、VoicePipeline 跑通、30 个预设、多效果组合）：
 
 ```bat
 .venv\Scripts\python.exe test_voice_core.py

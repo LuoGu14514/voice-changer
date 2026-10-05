@@ -285,13 +285,80 @@ def test_voice_presets_callable():
               f"len={y.size} peak={peak:.3f} (in={in_peak:.3f})")
 
 
+def test_effects_config_multi():
+    """process_offline 的 effects_config 多效果 dict 字段能跑通。"""
+    x = vowel_like(f0=180.0, formants=(500.0, 1500.0, 2500.0), dur=0.5)
+    cfg = {
+        "robot": {"enabled": True, "hz": 80.0},
+        "tone_eq": {"enabled": True, "bass_db": -2.0, "treble_db": 1.5},
+        "breath": {"enabled": True, "strength": 0.2},
+        "reverb": {"enabled": True, "mix": 0.3},
+    }
+    y = vc.process_offline(x, SR, semitones=4.0, form_shift_ratio=1.10,
+                            effects_config=cfg, formant_correct=True)
+    peak = float(np.max(np.abs(y)))
+    check("process_offline + effects_config (4 效果叠加)",
+          np.all(np.isfinite(y)) and y.size == x.size and peak < 5.0,
+          f"len={y.size} peak={peak:.3f}")
+
+
+def test_effects_config_priority():
+    """effects_config 覆盖 effect 字符串。"""
+    x = vowel_like(f0=180.0, formants=(500.0, 1500.0, 2500.0), dur=0.3)
+    cfg_empty = {}
+    cfg_robot = {"robot": {"enabled": True, "hz": 60.0}}
+    # 都给，effects_config 应优先
+    y = vc.process_offline(x, SR, semitones=0.0,
+                            effect="echo",
+                            effects_config=cfg_robot)
+    # robot 开启时峰值会显著大于原信号（x * sin(60Hz) 包络让峰值降低）
+    y_only_robot = vc.process_offline(x, SR, semitones=0.0, effects_config=cfg_robot)
+    y_only_echo = vc.process_offline(x, SR, semitones=0.0, effect="echo")
+    diff_with_echo = float(np.max(np.abs(y - y_only_echo)))
+    diff_with_robot = float(np.max(np.abs(y - y_only_robot)))
+    check("effects_config 优先于 effect 字符串",
+          diff_with_robot < diff_with_echo,
+          f"diff(echo)={diff_with_echo:.4f} diff(robot)={diff_with_robot:.4f}")
+
+
+def test_normalize_effect_spec():
+    """_normalize_effect_spec 兼容 None/str/dict/空。"""
+    from voice_core import _normalize_effect_spec, LEGACY_EFFECT_CONFIGS
+    check("None → {}", _normalize_effect_spec(None) == {},
+          repr(_normalize_effect_spec(None)))
+    check("空 → {}", _normalize_effect_spec("") == {},
+          repr(_normalize_effect_spec("")))
+    check("'robot' → robot config",
+          "robot" in _normalize_effect_spec("robot"),
+          repr(_normalize_effect_spec("robot")))
+    check("dict → 原样",
+          _normalize_effect_spec({"reverb": {"enabled": True, "mix": 0.5}})
+          == {"reverb": {"enabled": True, "mix": 0.5}},
+          repr(_normalize_effect_spec({"reverb": {"enabled": True, "mix": 0.5}})))
+    check("未知字符串 → {}", _normalize_effect_spec("xxxxx") == {},
+          repr(_normalize_effect_spec("xxxxx")))
+
+
+def test_effect_rack_available():
+    """EffectRack 公开 API 可用。"""
+    from voice_core import EffectRack
+    rack = EffectRack(SR, 512)
+    x = vowel_like(f0=180.0, formants=(500.0, 1500.0, 2500.0), dur=0.3)
+    y = rack.process(x, {"robot": {"enabled": True, "hz": 60.0}})
+    check("EffectRack 直连 robot",
+          np.all(np.isfinite(y)) and y.size == x.size,
+          f"len={y.size} peak={float(np.max(np.abs(y))):.3f}")
+
+
 def main():
     print(f"numpy {np.__version__}, 采样率 {SR}\n")
     for fn in (test_identity_exact, test_identity_noise, test_pitch_ratio, test_duration_and_rms,
                test_no_nan_or_clip, test_ratio_change_is_safe, test_effect_robot,
                test_effect_echo, test_effect_phone, test_offline_gain_and_length,
                test_formant_corrector_identity, test_formant_pull_back_centroid,
-               test_voice_pipeline_does_not_crash, test_voice_presets_callable):
+               test_voice_pipeline_does_not_crash, test_voice_presets_callable,
+               test_effects_config_multi, test_effects_config_priority,
+               test_normalize_effect_spec, test_effect_rack_available):
         print(f"--- {fn.__name__} ---")
         fn()
         print()
