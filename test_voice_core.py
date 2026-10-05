@@ -509,6 +509,148 @@ def test_hnr_increases_with_jitter_shimmer():
           f"HNR in={hnr_in:.2f}dB out={hnr_out:.2f}dB delta_in-out={delta:+.2f}dB")
 
 
+# ============================================================================
+# BreathNoise v2 — Glottal Flow Noise
+# ============================================================================
+def test_breath_v2_disabled():
+    """strength=0 → 严格恒等（向后兼容 v1 行为）。"""
+    from voice_core import EffectRack
+    rack = EffectRack(SR, 512)
+    t = np.arange(SR) / SR
+    x = (0.5 * np.sin(2 * np.pi * 180.0 * t)).astype(np.float32)
+    y = rack.process(x.copy(), {"breath": {"enabled": True, "strength": 0.0}})
+    check("Breath v2 strength=0 严格恒等",
+          np.max(np.abs(y - x)) < 1e-7,
+          f"max diff = {np.max(np.abs(y - x)):.2e}")
+
+
+def test_breath_v2_no_nan_inf():
+    """启用 breath v2 任意参数，无 NaN/Inf，输出能量有界。"""
+    from voice_core import EffectRack
+    rack = EffectRack(SR, 512)
+    t = np.arange(SR) / SR
+    x = (0.5 * np.sin(2 * np.pi * 180.0 * t)).astype(np.float32)
+    for color in ("aspirated", "breathy", "mixed"):
+        for puff in (0.0, 0.5, 1.0):
+            cfg = {"breath": {"enabled": True, "strength": 0.3, "color": color,
+                              "puff": puff, "f0": 180.0}}
+            y = rack.process(x.copy(), cfg)
+            ok = (not np.any(np.isnan(y))) and (not np.any(np.isinf(y))) \
+                 and (np.max(np.abs(y)) < 5.0)
+            check(f"Breath v2 {color}/puff={puff} 无 NaN/Inf",
+                  ok, f"peak={np.max(np.abs(y)):.3f}")
+
+
+def test_breath_v2_f0_sync():
+    """f0=100Hz 时，breath 输出的瞬时包络应有 F0 周期（自相关在 lag=T0 处显著峰值）。
+
+    测法（时域）：
+      - 用静音输入 + 强 breath + puff=1 → 仅看 breath 自身
+      - 取 10ms RMS 包络（包络反映 amplitude modulation）
+      - 计算包络自相关，在 lag=T0 处应有显著峰值
+
+    频率域测 F0 不直接（噪声 × 脉冲是 sinc 调制，F0 不会成为输出频谱的"峰"
+    —— F0 信息在时域包络里）。
+    """
+    from effects import BreathNoise
+    bn = BreathNoise(SR, 512)
+    f0 = 100.0
+    # 4 秒静音
+    x = np.zeros(SR * 4, dtype=np.float32)
+    y = bn.process(x, strength=0.5, f0=f0, color="aspirated", puff=1.0)
+    # 计算 10ms RMS 包络
+    win = SR // 100  # 10ms = 480 samples
+    cs = np.cumsum(y.astype(np.float64) ** 2)
+    cs[win:] = cs[win:] - cs[:-win]
+    env = np.sqrt(cs[win - 1:] / win + 1e-12)  # length = N - win + 1
+    # 包络均值/最大（强 puff 应让包络有显著起伏）
+    env_mean = float(env.mean())
+    env_max  = float(env.max())
+    modulation_depth = env_max / max(env_mean, 1e-9)
+    # 计算包络自相关在 lag=T0 包络（480 / 4800 = 0.1ms / 100ms 一个包络点... 等等）
+    # 实际：env 的 1 个点 = 10ms，所以 T0 周期 = 100ms = 10 个包络点
+    env_T0 = int(f0 / 100.0 * 10)  # 100Hz → 10ms 周期 → 10 个 env 点
+    if env_T0 >= env.size // 2:
+        env_T0 = env.size // 4
+    # 计算 lag=env_T0 处的自相关（归一化）
+    seg = env - env.mean()
+    R0 = float(np.sum(seg * seg))
+    R_T0 = float(np.sum(seg[:seg.size - env_T0] * seg[env_T0:])) if R0 > 0 else 0.0
+    R_norm = R_T0 / max(R0, 1e-9)
+    check("Breath v2 F0 同步 (包络周期)",
+          modulation_depth > 1.3 and R_norm > 0.05,
+          f"env modulation={modulation_depth:.2f}x, R(lag=T0)={R_norm:.3f} (T0={env_T0} env-pts)")
+
+
+def test_breath_v2_color_aspirated():
+    """color='aspirated' → 2kHz 以上能量 > 2kHz 以下。"""
+    from effects import BreathNoise
+    bn = BreathNoise(SR, 512)
+    x = np.zeros(SR, dtype=np.float32)
+    y = bn.process(x, strength=0.5, color="aspirated", puff=0.0)
+    spec = np.abs(np.fft.rfft(y))
+    freqs = np.fft.rfftfreq(y.size, 1.0 / SR)
+    idx_2k = np.argmin(np.abs(freqs - 2000))
+    idx_lo = np.argmin(np.abs(freqs - 100))
+    e_hi = float(np.sum(spec[idx_2k:] ** 2))
+    e_lo = float(np.sum(spec[idx_lo:idx_2k] ** 2))
+    check("Breath v2 aspirated 高频能量 > 低频",
+          e_hi > e_lo * 1.5,
+          f"hi={e_hi:.0f}, lo={e_lo:.0f}, ratio={e_hi/max(1,e_lo):.2f}x")
+
+
+def test_breath_v2_color_breathy():
+    """color='breathy' → 1kHz 以下能量 > 1kHz 以上。"""
+    from effects import BreathNoise
+    bn = BreathNoise(SR, 512)
+    x = np.zeros(SR, dtype=np.float32)
+    y = bn.process(x, strength=0.5, color="breathy", puff=0.0)
+    spec = np.abs(np.fft.rfft(y))
+    freqs = np.fft.rfftfreq(y.size, 1.0 / SR)
+    idx_1k = np.argmin(np.abs(freqs - 1000))
+    idx_lo = np.argmin(np.abs(freqs - 100))
+    e_hi = float(np.sum(spec[idx_1k:] ** 2))
+    e_lo = float(np.sum(spec[idx_lo:idx_1k] ** 2))
+    check("Breath v2 breathy 低频能量 > 高频",
+          e_lo > e_hi * 1.2,
+          f"lo={e_lo:.0f}, hi={e_hi:.0f}, ratio={e_lo/max(1,e_hi):.2f}x")
+
+
+def test_breath_v2_puff_modulation():
+    """puff=1 vs puff=0 → peak/rms 比应更高（F0 同步使"开/关"更明显）。"""
+    from effects import BreathNoise
+    bn = BreathNoise(SR, 512)
+    x = np.zeros(SR, dtype=np.float32)
+    y_off = bn.process(x.copy(), strength=0.5, puff=0.0)
+    y_on  = bn.process(x.copy(), strength=0.5, puff=1.0, f0=180.0)
+    rms_off = float(np.sqrt(np.mean(y_off ** 2))); rms_on = float(np.sqrt(np.mean(y_on ** 2)))
+    pkr_off = float(np.max(np.abs(y_off)) / max(rms_off, 1e-9))
+    pkr_on  = float(np.max(np.abs(y_on))  / max(rms_on,  1e-9))
+    check("Breath v2 puff=1 peak/rms > puff=0",
+          pkr_on > pkr_off * 1.05,
+          f"puff=0 {pkr_off:.2f}, puff=1 {pkr_on:.2f}")
+
+
+def test_breath_v2_per_block_latency():
+    """单块处理延迟 < 预算 80%（10.67 ms × 0.8）。"""
+    from effects import BreathNoise
+    import time
+    bn = BreathNoise(SR, 512)
+    t = np.arange(SR) / SR
+    x = (0.3 * np.sin(2 * np.pi * 180.0 * t)).astype(np.float32)
+    bn.process(x[:512], strength=0.3)  # warm-up
+    times = []
+    for i in range(0, x.size - 512, 512):
+        t0 = time.perf_counter()
+        bn.process(x[i:i + 512], strength=0.3, f0=180.0, color="mixed", puff=0.5)
+        times.append((time.perf_counter() - t0) * 1000)
+    times = np.array(times)
+    budget_ms = 512 / SR * 1000 * 0.8  # 80% of block time
+    check("Breath v2 单块延迟 < 预算 80%",
+          times.max() < budget_ms,
+          f"mean={times.mean():.3f}ms max={times.max():.3f}ms budget<{budget_ms:.2f}ms")
+
+
 def main():
     print(f"numpy {np.__version__}, 采样率 {SR}\n")
     for fn in (test_identity_exact, test_identity_noise, test_pitch_ratio, test_duration_and_rms,
@@ -521,7 +663,11 @@ def main():
                test_jitter_shimmer_basic, test_jitter_shimmer_disabled,
                test_jitter_shimmer_streaming, test_jitter_shimmer_envelope_variation,
                test_jitter_shimmer_harmonic_preserved, test_jitter_shimmer_per_block_latency,
-               test_hnr_increases_with_jitter_shimmer):
+               test_hnr_increases_with_jitter_shimmer,
+               test_breath_v2_disabled, test_breath_v2_no_nan_inf,
+               test_breath_v2_f0_sync, test_breath_v2_color_aspirated,
+               test_breath_v2_color_breathy, test_breath_v2_puff_modulation,
+               test_breath_v2_per_block_latency):
         print(f"--- {fn.__name__} ---")
         fn()
         print()

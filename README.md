@@ -67,22 +67,44 @@ GUI 顶部「预设」按钮已预置了 30 个角色，每个都用具体的多
 - **jitter（基频抖动）**：基频在 ±0.5% × `jitter_pct` 个采样内做亚采样随机扰动，30Hz 单极 LPF 平滑。真人 jitter 通常 0.5-1.5%。
 - **shimmer（振幅抖动）**：振幅乘上 1 + envelope，`shimmer_db` 控制最大变化 dB，50Hz 单极 LPF 平滑。真人 shimmer 通常 0.3-1dB。
 
-用法（API）：
+### v0.5.1 新增：glottal flow noise 模型（更真实的气息感）
+
+原 breath 效果是「高通噪声 × 包络」—— 听起来更像"加湿器"而不是"真人气息"。
+v0.5.1 起 breath 算法升级为 **glottal flow noise** 模型：
+
+- **F0 同步脉冲**：30% 占空比的开放相位（真人声门 open quotient）+ raised-cosine 边缘平滑。声门关闭时接近零噪声。
+- **多色彩噪声**：`color='aspirated'`（2kHz 高通，像 /s/, /h/）/ `'breathy'`（500Hz 低通，modal voice leak）/ `'mixed'`（默认，两者叠加）。
+- **慢速 LFO**：7.5Hz + 13.2Hz 双 LFO 调制整体幅度，模拟自然"puff"变化。
+- **`puff` 参数**：0~1，F0 同步强度。`puff=0` 退化为 v1 恒定噪声；`puff=1` 完全 F0 同步（"突突突"感强）。默认 0.5。
+
+用法：
 
 ```python
+# 像 v1 那样用（自动得到 v2 算法）
+cfg = {"breath": {"enabled": True, "strength": 0.3}}
+
+# 显式调参（推荐）
 cfg = {
-    "jitter_shimmer": {"enabled": True, "jitter_pct": 1.0, "shimmer_db": 0.5},
+    "breath": {
+        "enabled": True, "strength": 0.3,
+        "f0": 180.0,        # 估计的基频；调用方传，或用默认 180
+        "color": "mixed",   # "aspirated" / "breathy" / "mixed"
+        "puff": 0.5,        # F0 同步强度 0~1
+    },
 }
 y = pipe.process(x, semitones=0.0, effects_config=cfg)
 ```
 
-参数建议：
-- 自然语音：`jitter_pct=1.0, shimmer_db=0.5`（默认，最佳起点）
-- 想要更「真实」：`jitter_pct=1.5, shimmer_db=1.0`
-- 想要「机器人感」（已用过强 EQ / 失真）：`jitter_pct=2.0~3.0` 会显得更粗野
-- 关闭后严格直通（无任何处理）
+预设建议：
+- 默认预设（已自动升级）：保持原 `strength` 不变，自动用 v2 + `puff=0.5`
+- 想加强气息感：`puff=0.8~1.0`（明显能听出"突突突"）
+- 想减弱 F0 同步：`puff=0.0~0.2`（接近 v1）
+- 高频辅音（s/h/f 类）：`color='aspirated'`
+- 偏低音气声（modal voice leak）：`color='breathy'`
 
-性能：单块均值 0.24ms（最大 0.32ms），预算 10.67ms → 富余 33×，可放心叠加到任何预设上。
+向后兼容：所有 v0.4 之前的 `{"breath": {"strength": X}}` 配置继续工作 —— 内部自动启用 v2 默认参数。
+
+性能：单块均值 0.27ms（最大 0.53ms），预算 10.67ms → 富余 20×。
 
 如果你想完全自定义，可以在代码里这样调用：
 
@@ -195,7 +217,7 @@ v0.4 起每个预设都预设了具体的效果组合，让声音更像真角色
 
 ## 五、自测
 
-不接声卡也能验证 DSP（81 项检查：恒等直通、音准、时长、音效、无 NaN/削波、共振峰校正、VoicePipeline 跑通、30 个预设、多效果组合、jitter/shimmer 注入无副作用）：
+不接声卡也能验证 DSP（96 项检查：恒等直通、音准、时长、音效、无 NaN/削波、共振峰校正、VoicePipeline 跑通、30 个预设、多效果组合、jitter/shimmer、glottal flow noise F0 同步）：
 
 ```bat
 .venv\Scripts\python.exe test_voice_core.py

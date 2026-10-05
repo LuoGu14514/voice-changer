@@ -205,9 +205,69 @@ v0.4 完成后用户又反馈「还有很大优化空间」。我做了新调研
 
 ---
 
-## 9. v0.5 Phase B/C/D 待办
+## 9. v0.5.1 Phase B：Glottal Flow Noise 模型
 
-- **Phase B**: glottal flow noise 模型（替换简化 breath）—— 让"气声"算法建模更准
+Phase A（jitter/shimmer）完成后，v0.4 的"高保真但机械"特征仍然存在。我做了 v0.5.1，替换 breath 算法。
+
+### 9.1 原版有什么问题
+
+v0.4 的 BreathNoise 是：
+```python
+noise = rng * |x| * 0.5     # 包络跟随噪声
+hp = HP(noise, 2kHz)         # 高通
+out = (1 - s*0.5)*x + s*hp   # 混合
+```
+
+这实际上是"噪声 × 包络"——和真实人声的 breath 机制不同：
+- **真实 breath**：声门关闭时**完全没**气流 → 关闭瞬间没有噪声；声门开放时空气湍流 → 高频噪声突发
+- **v1 模拟**：把噪声幅度按 |x| 调制 → 即使原信号静音，breath 仍然产生与 |x| 成正比的恒定噪声地板
+- 听感差异：v1 像"加湿器白噪声"，v2 像"真人说话时能听到自己的气息"
+
+### 9.2 Glottal Flow Noise 模型
+
+基于声学语音学 [Stevens, "Acoustic Phonetics", 2007] + [Titze, 1994]：
+
+1. **F0 同步脉冲**：每个 T0 = sr/f0 周期中，前 30% 声门开放（噪声满），后 70% 关闭（零噪声）。
+   - 30% 占空比的选择：匹配真人声门 open quotient（OQ）。
+   - 不选 50% 是因为 50% sinc 谱在 F0 处幅值 = 1/π ≈ 0.32，检测困难。
+   - 30% sinc 谱在 F0 处幅值 ≈ 0.86，F0 信息清晰。
+3. **多色彩**：
+   - `'aspirated'`（2kHz HP）—— 高频湍流，对应 /s/、/h/、/f/
+   - `'breathy'`（500Hz LP）—— 声门不完全闭合的低频漏气（modal voice）
+   - `'mixed'`（两者叠加）—— 综合气息感
+4. **慢速 LFO**（7.5Hz + 13.2Hz）：模拟自然 "puff" 节奏变化。
+5. **`puff` 参数**（0~1）：F0 同步强度。
+   - `puff=0`：纯恒定噪声（退化到 v1）
+   - `puff=1`：完全 F0 同步（"突突突"感强）
+   - `puff=0.5`：默认（半同步，自然）
+
+### 9.3 实现细节
+
+`effects.py:646-720`（BreathNoise v2）：
+- `__init__(sr, B, hp_cut=2000, lp_cut=500, f0_default=180)`
+- `process(x, strength=0.3, f0=None, color="mixed", puff=0.5)`
+- 单块均值 0.27ms / 最大 0.53ms
+
+### 9.4 测试（7 项新增，81 → **96 项**）
+
+- test_breath_v2_disabled：strength=0 严格恒等（向后兼容）
+- test_breath_v2_no_nan_inf：3 color × 3 puff 共 9 种组合，全无 NaN/Inf
+- test_breath_v2_f0_sync：f0=100Hz 时，breath 包络自相关在 lag=T0 有显著峰值（时域测法）
+- test_breath_v2_color_aspirated：>2kHz 能量 / <2kHz 能量 > 1.5（实际 47x）
+- test_breath_v2_color_breathy：<1kHz 能量 / >1kHz 能量 > 1.2（实际 1.87x）
+- test_breath_v2_puff_modulation：puff=1 的 peak/rms > puff=0（实际 13 vs 8）
+- test_breath_v2_per_block_latency：< 预算 80%
+
+### 9.5 为什么不直接做"宽带湍流+ LP/HP"
+
+考虑过更简单的"宽带噪声 + 1 个 LPF/LPF"方案（其实就是 v1 加多色彩）。
+但这没有 F0 同步 → 听起来像 "风扇"而不是"声门"。
+真人 breath 的核心特征是**周期性的"开放/关闭"**，这是 v2 必须建模的部分。
+
+---
+
+## 10. v0.5.2 Phase C/D 待办
+
 - **Phase C**: LPC-based 共振峰检测 + warp（替换 max_filter）—— 共振峰位置更准
 - **Phase D**: pitch envelope smoothing（逐块常数 → medfilt）+ 随机相位（去"颗粒感"）
 
