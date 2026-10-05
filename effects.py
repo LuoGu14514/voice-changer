@@ -30,6 +30,7 @@ __all__ = [
     "BreathNoise",
     "Tremolo",
     "Vibrato",
+    "JitterShimmer",
     "SilenceSaver",
     "EffectRack",
     "build_effect_rack",
@@ -39,24 +40,25 @@ __all__ = [
 EFFECT_NAMES = (
     "noise_gate", "robot", "whisper", "telephone", "distortion", "bitcrush",
     "chorus", "echo", "reverb", "tone_eq", "compressor", "output_gain",
-    "tremolo", "vibrato", "breath",
+    "tremolo", "vibrato", "breath", "jitter_shimmer",
 )
 EFFECT_LABELS = {
-    "noise_gate":  "降噪门",
-    "robot":       "机器人",
-    "whisper":     "气音",
-    "telephone":   "电话音",
-    "distortion":  "失真",
-    "bitcrush":    "位破坏",
-    "chorus":      "合唱",
-    "echo":        "回声",
-    "reverb":      "混响",
-    "tone_eq":     "音色 EQ",
-    "compressor":  "压缩器",
-    "output_gain": "输出增益",
-    "tremolo":     "颤音",
-    "vibrato":     "震音",
-    "breath":      "呼吸声",
+    "noise_gate":     "降噪门",
+    "robot":          "机器人",
+    "whisper":        "气音",
+    "telephone":      "电话音",
+    "distortion":     "失真",
+    "bitcrush":       "位破坏",
+    "chorus":         "合唱",
+    "echo":           "回声",
+    "reverb":         "混响",
+    "tone_eq":        "音色 EQ",
+    "compressor":     "压缩器",
+    "output_gain":    "输出增益",
+    "tremolo":        "颤音",
+    "vibrato":        "震音",
+    "breath":         "呼吸声",
+    "jitter_shimmer": "微抖动",
 }
 
 
@@ -668,6 +670,98 @@ class BreathNoise:
 
 
 # =============================================================================
+# JitterShimmer —— 微抖动（基频/振幅扰动）
+# =============================================================================
+class JitterShimmer:
+    """给声音加 cycle-to-cycle 微扰，让「机械处理感」变「真人感」。
+
+    两类扰动：
+      - **shimmer_db**：振幅扰动（dB）。真实人声 shimmer local 通常 0.3-1.0 dB，
+        病理嗓音 > 3 dB。给 0.5 dB 是个"刚刚好"的值。
+      - **jitter_pct**：基频周期扰动（百分比）。真实人声 jitter local 通常 0.5-1.5%，
+        病理嗓音 > 3%。给 1.0% 是温和值。
+
+    实现策略（不需知道 F0）：
+      - shimmer：白噪声 → 一阶 IIR 低通（~50ms 时间常数）→ 增益调制
+      - jitter：白噪声 → 一阶 IIR 低通（~30ms 时间常数）→ 映射为 ±几个采样的
+        分数延迟 → np.interp 重采样。频率上的感受是「周期微微抖动」。
+
+    状态：跨块保留 IIR 状态 `_lp_shimmer` / `_lp_jitter`，避免 click。
+    """
+
+    def __init__(self, sr: int, B: int,
+                 jitter_pct: float = 1.0,
+                 shimmer_db: float = 0.5,
+                 jitter_cut_hz: float = 30.0,
+                 shimmer_cut_hz: float = 50.0):
+        self.sr = int(sr); self.B = int(B)
+        self.jitter_pct = float(jitter_pct)
+        self.shimmer_db = float(shimmer_db)
+        # IIR 系数
+        self.a_jitter = float(np.exp(-2.0 * np.pi * jitter_cut_hz / sr))
+        self.a_shimmer = float(np.exp(-2.0 * np.pi * shimmer_cut_hz / sr))
+        self._lp_jitter = np.float32(0.0)
+        self._lp_shimmer = np.float32(0.0)
+        self._rng = np.random.default_rng()
+
+    def reset(self):
+        self._lp_jitter = np.float32(0.0)
+        self._lp_shimmer = np.float32(0.0)
+
+    def _iir_lp_loop(self, x: np.ndarray, a: float, state: np.float32):
+        """一阶 IIR 低通，B=512 单次 ~ 0.05ms。"""
+        y = np.empty_like(x)
+        z = state
+        a1 = np.float32(a)
+        one_minus_a = np.float32(1.0 - a)
+        for i in range(x.size):
+            z = one_minus_a * x[i] + a1 * z
+            y[i] = z
+        return y, z
+
+    def process(self, x: np.ndarray,
+                jitter_pct: float | None = None,
+                shimmer_db: float | None = None) -> np.ndarray:
+        x = np.asarray(x, dtype=np.float32).reshape(-1)
+        if x.size == 0:
+            return x
+        n = x.size
+        jp = self.jitter_pct if jitter_pct is None else float(jitter_pct)
+        sd = self.shimmer_db if shimmer_db is None else float(shimmer_db)
+
+        out = x.copy()
+        # ---- shimmer: amplitude modulation ----
+        if sd > 1e-4:
+            noise = self._rng.standard_normal(n).astype(np.float32)
+            shimmer_env, self._lp_shimmer = self._iir_lp_loop(noise, self.a_shimmer,
+                                                              self._lp_shimmer)
+            # 把 LPF 噪声中心化、归一化到 shimmer_db dB 范围
+            # shimmer_env 期望 σ ≈ sqrt(a/(2-a)) 约为 0.7，做简单放缩
+            peak_db = sd
+            gain_lin_max = 10 ** (peak_db / 20.0) - 1.0  # 半边
+            shimmer_env -= shimmer_env.mean()
+            # 3σ 限幅
+            sigma = float(np.sqrt(np.mean(shimmer_env * shimmer_env)) + 1e-9)
+            shimmer_env = shimmer_env / (sigma * 3.0) * gain_lin_max
+            out *= (1.0 + shimmer_env)
+
+        # ---- jitter: fractional sample delay via linear interpolation ----
+        if jp > 1e-4:
+            noise = self._rng.standard_normal(n).astype(np.float32)
+            jitter_env, self._lp_jitter = self._iir_lp_loop(noise, self.a_jitter,
+                                                            self._lp_jitter)
+            jitter_env -= jitter_env.mean()
+            # 抖动量映射：1% jitter 对应约 0.5 个采样（典型 F0~150Hz 周期 320 样）
+            sigma = float(np.sqrt(np.mean(jitter_env * jitter_env)) + 1e-9)
+            jitter_env = jitter_env / (sigma * 3.0) * jp * 0.5
+            t = np.arange(n, dtype=np.float32)
+            t_jit = t + jitter_env
+            t_jit = np.clip(t_jit, 0.0, n - 1.001)
+            out = np.interp(t_jit, t, out).astype(np.float32)
+        return out
+
+
+# =============================================================================
 # SilenceSaver —— 静音时跳过 DSP，节省算力
 # =============================================================================
 class SilenceSaver:
@@ -752,6 +846,7 @@ class EffectRack:
         self.tremolo = Tremolo(sr, B)
         self.vibrato = Vibrato(sr, B)
         self.breath = BreathNoise(sr, B)
+        self.jitter_shimmer = JitterShimmer(sr, B)
         self.silence_saver = SilenceSaver(sr, B)
 
     def reset(self):
@@ -814,6 +909,11 @@ class EffectRack:
         if config.get("breath", {}).get("enabled"):
             c = config["breath"]
             x = self.breath.process(x, strength=c.get("strength", 0.3))
+        if config.get("jitter_shimmer", {}).get("enabled"):
+            c = config["jitter_shimmer"]
+            x = self.jitter_shimmer.process(x,
+                jitter_pct=c.get("jitter_pct", 1.0),
+                shimmer_db=c.get("shimmer_db", 0.5))
         if config.get("output_gain", {}).get("enabled"):
             c = config["output_gain"]
             x = self.output_gain.process(x, gain_db=c.get("gain_db", 0.0))

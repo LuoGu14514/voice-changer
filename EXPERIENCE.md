@@ -141,6 +141,78 @@ v0.2 上线后用户听了反馈：「升调后的声音和真实女声有很大
 
 ---
 
+## 7. v0.4：15 效果器 rack + 30 预设重平衡（用户 v0.3 反馈"声音还是不像真人"）
+
+v0.3 把预设数扩到 30、参考 MaidMic/neboyang/lyrebird/SUONSUN9527 数据调参后，用户实测反馈
+「声音还是不像真人」。我意识到：**单纯调 pitch+formant 永远是合成声**。真人声音有大量「微抖动」——
+jitter（基频抖动）、shimmer（振幅抖动）、气息感、声门噪声、随机共振峰偏移等，这些是算法无法"算出来"的，
+只能注入。
+
+### v0.4 落地
+
+**新调研**（参考 sioaeko/OpenVoiceChanger 105★ MIT 的设计）：
+- **Effect Rack**：单一效果器串联容易造成"叠加看起来对、听感怪"——必须按工程师顺序：noise_gate →
+  调制类（robot/whisper/telephone）→ 失真类（distortion/bitcrush）→ 时间类（chorus/echo/reverb）→
+  EQ/compressor → 调制微抖（tremolo/vibrato/breath）→ output_gain → silence_saver
+- **15 个效果器**（每个独立 class，纯 numpy）：noise_gate / robot / whisper / telephone / distortion /
+  bitcrush / chorus / echo / reverb / tone_eq / compressor / output_gain / tremolo / vibrato / breath /
+  silence_saver
+- **30 个预设每个都配多效果组合**（不是单一效果），覆盖 MAidMic 萝莉/嗲嗲/花栗鼠、SUONSUN9527
+  兽人/幽灵/外星人的精确 echo delay（40ms / 350ms）等
+- 测试 63 → **74 项**
+
+---
+
+## 8. v0.5 Phase A：JitterShimmer（让纯合成音"呼吸起来"）
+
+v0.4 完成后用户又反馈「还有很大优化空间」。我做了新调研，问用户选了 4 阶段方案（A→B→C→D），本文
+只覆盖已经完成的 A 阶段（jitter/shimmer）。
+
+### 8.1 为什么要加 jitter/shimmer？
+
+**语音学基础**（[Titze, Principles of Voice Production, 1994]）：
+- **jitter** = 基频的 cycle-to-cycle 扰动（FF0 vs F0）。真人典型 0.5-1.5%，帕金森病人 >3%。
+  病理上是「声带张力不均」的反映，正常情况下属于「自然」特征。
+- **shimmer** = 振幅的 cycle-to-cycle 扰动。真人典型 0.3-1 dB（约 ±10-15%）。
+- 任何「干净的合成音」（jitter=0、shimmer=0）都会被听感识别为「机器处理过」「Siri 风」。
+- 注入适量的 jitter/shimmer 是让 DSP 变声器「更像真人」最便宜、最有效的手段。
+
+**实现选型**：
+- jitter 用亚采样（< 1 采样）随机扰动 + 30Hz 单极 LPF（语音学模型是基频 lf-cycle 模型扰动）。
+- shimmer 用白噪声 → 50Hz LPF → 包络乘。LPF 截止频率来自「语音幅度包络自然带宽」经验值。
+- 不做「基频检测 + 真实 F0 重采样」是因为延迟会从 17ms 涨到 30ms+，且单核 CPU 撑不住。
+- 不做 Perlin noise，因为人耳对高频细节不敏感、对 jitter 周期不敏感，白噪声 + LPF 听感上完全够用。
+
+### 8.2 落地细节
+
+`effects.py:JitterShimmer`（effects.py:170-230）：
+- `__init__(sr, B, jitter_pct=1.0, shimmer_db=0.5, jitter_cut_hz=30.0, shimmer_cut_hz=50.0)`
+- 独立 RNG (`np.random.default_rng()`)，每次 reset 不重新播种 → 长时间使用不重复
+- shimmer = white_noise → LPF(50Hz) → 3σ 中心化 → envelope = 1 + env * (10^(shimmer_db/20)-1)
+- jitter = white_noise → LPF(30Hz) → 3σ 中心化 → ±0.5*jitter_pct 个采样 → np.interp 重采样
+- 单块 0.24ms（最大 0.32ms），预算 10.67ms → 富余 33×
+
+### 8.3 测试
+
+新增 7 项测试（74 → **81 项**全过）：
+- test_jitter_shimmer_basic：启用无 NaN/Inf
+- test_jitter_shimmer_disabled：未启用 → 严格直通（max|y-x|=0）
+- test_jitter_shimmer_streaming：流式 vs 单次 RMS 一致（diff<0.05）
+- test_jitter_shimmer_envelope_variation：shimmer_db=3.0 时稳态正弦 50ms RMS peak/mean 比增大
+- test_jitter_shimmer_harmonic_preserved：F0 偏移 <10Hz（不变调时基频不动）
+- test_jitter_shimmer_per_block_latency：单块 < 预算 80%
+- test_hnr_increases_with_jitter_shimmer：HNR 略降（注入噪声的正确方向）
+
+---
+
+## 9. v0.5 Phase B/C/D 待办
+
+- **Phase B**: glottal flow noise 模型（替换简化 breath）—— 让"气声"算法建模更准
+- **Phase C**: LPC-based 共振峰检测 + warp（替换 max_filter）—— 共振峰位置更准
+- **Phase D**: pitch envelope smoothing（逐块常数 → medfilt）+ 随机相位（去"颗粒感"）
+
+---
+
 ## 7. 还可以做（v0.4+ 候选）
 
 - 用 LPC（线性预测）估包络代替 rolling max —— pprablanc 的半成品仓库

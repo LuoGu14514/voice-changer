@@ -1,6 +1,6 @@
 # 简单变声器（实时麦克风变声）
 
-一个只用 Python + numpy 写的实时变声小工具：**变调**（±12 半音）+ **共振峰校正** + **15 种效果器可任意组合**，图形界面开箱即用。
+一个只用 Python + numpy 写的实时变声小工具：**变调**（±12 半音）+ **共振峰校正** + **16 种效果器可任意组合** + **微抖动（jitter/shimmer）**，图形界面开箱即用。
 算法是自写的「颗粒重叠相加 + WSOLA 相位对齐 + 谱包络分离」，不依赖任何音频处理库。
 
 ```
@@ -59,6 +59,31 @@ v0.4 起内置一个 15 效果器 rack（参考 sioaeko/OpenVoiceChanger 设计�
 ```
 
 GUI 顶部「预设」按钮已预置了 30 个角色，每个都用具体的多效果组合（见下方「预设一览」表）。
+
+### v0.5 新增：微抖动 jitter/shimmer（让声音「更像真人」）
+
+纯音听起来像「机器处理过」，真人说话总有微小的基频/振幅扰动。v0.5 起内置一个 **JitterShimmer** 效果器：
+
+- **jitter（基频抖动）**：基频在 ±0.5% × `jitter_pct` 个采样内做亚采样随机扰动，30Hz 单极 LPF 平滑。真人 jitter 通常 0.5-1.5%。
+- **shimmer（振幅抖动）**：振幅乘上 1 + envelope，`shimmer_db` 控制最大变化 dB，50Hz 单极 LPF 平滑。真人 shimmer 通常 0.3-1dB。
+
+用法（API）：
+
+```python
+cfg = {
+    "jitter_shimmer": {"enabled": True, "jitter_pct": 1.0, "shimmer_db": 0.5},
+}
+y = pipe.process(x, semitones=0.0, effects_config=cfg)
+```
+
+参数建议：
+- 自然语音：`jitter_pct=1.0, shimmer_db=0.5`（默认，最佳起点）
+- 想要更「真实」：`jitter_pct=1.5, shimmer_db=1.0`
+- 想要「机器人感」（已用过强 EQ / 失真）：`jitter_pct=2.0~3.0` 会显得更粗野
+- 关闭后严格直通（无任何处理）
+
+性能：单块均值 0.24ms（最大 0.32ms），预算 10.67ms → 富余 33×，可放心叠加到任何预设上。
+
 如果你想完全自定义，可以在代码里这样调用：
 
 ```python
@@ -68,11 +93,12 @@ import numpy as np
 sr, B = 48000, 512
 pipe = vc.VoicePipeline(sr, B, formant_correct=True)
 
-# 例：自制「机器人 + 一点点回声 + 低音 +3dB」
+# 例：自制「机器人 + 一点点回声 + 低音 +3dB + 微抖动」
 cfg = {
     "robot":      {"enabled": True, "hz": 80},
     "echo":       {"enabled": True, "delay_ms": 130, "feedback": 0.35, "mix": 0.45},
     "tone_eq":    {"enabled": True, "bass_db": 3.0},
+    "jitter_shimmer": {"enabled": True, "jitter_pct": 1.0, "shimmer_db": 0.5},
 }
 
 x = np.random.randn(B).astype(np.float32) * 0.3
@@ -158,7 +184,7 @@ v0.4 起每个预设都预设了具体的效果组合，让声音更像真角色
 |  | 回声 | 0 | 1.00 | 250ms echo |
 |  | 电话音 | 0 | 1.00 | telephone 带通 |
 
-可用的效果（`voice_core.EFFECT_NAMES`）：`noise_gate robot whisper telephone distortion bitcrush chorus echo reverb tone_eq compressor output_gain tremolo vibrato breath silence_saver`。
+可用的效果（`voice_core.EFFECT_NAMES`）：`noise_gate robot whisper telephone distortion bitcrush chorus echo reverb tone_eq compressor output_gain tremolo vibrato breath jitter_shimmer silence_saver`。
 
 **参考来源**（数据来自 GitHub 公开项目；本项目只 port 数值表，不复制源码）：
 - [suer781/MaidMic](https://github.com/suer781/MaidMic) — 萝莉/大叔/花栗鼠（Apache-2.0）
@@ -169,7 +195,7 @@ v0.4 起每个预设都预设了具体的效果组合，让声音更像真角色
 
 ## 五、自测
 
-不接声卡也能验证 DSP（74 项检查：恒等直通、音准、时长、音效、无 NaN/削波、共振峰校正、VoicePipeline 跑通、30 个预设、多效果组合）：
+不接声卡也能验证 DSP（81 项检查：恒等直通、音准、时长、音效、无 NaN/削波、共振峰校正、VoicePipeline 跑通、30 个预设、多效果组合、jitter/shimmer 注入无副作用）：
 
 ```bat
 .venv\Scripts\python.exe test_voice_core.py

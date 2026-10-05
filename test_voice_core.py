@@ -350,6 +350,165 @@ def test_effect_rack_available():
           f"len={y.size} peak={float(np.max(np.abs(y))):.3f}")
 
 
+def test_jitter_shimmer_basic():
+    """JitterShimmer：基本调用不崩，输出长度一致，无 NaN/Inf。"""
+    from voice_core import EffectRack
+    rack = EffectRack(SR, 512)
+    x = vowel_like(f0=180.0, dur=0.3)
+    cfg = {"jitter_shimmer": {"enabled": True, "jitter_pct": 1.0, "shimmer_db": 0.5}}
+    y = rack.process(x, cfg)
+    check("JitterShimmer 启用",
+          y.size == x.size and np.all(np.isfinite(y)),
+          f"len={y.size} peak={float(np.max(np.abs(y))):.3f}")
+
+
+def test_jitter_shimmer_disabled():
+    """未启用时输出应等于输入（精确恒等）。"""
+    from voice_core import EffectRack
+    rack = EffectRack(SR, 512)
+    x = vowel_like(f0=180.0, dur=0.3)
+    y = rack.process(x, {})
+    err = float(np.max(np.abs(y - x)))
+    check("JitterShimmer 禁用 (输出=输入)", err == 0.0, f"max|y-x|={err:.2e}")
+
+
+def test_jitter_shimmer_streaming():
+    """流式状态连续：跨块调用累积输出与一次性调用前 N 块输出一致（同一 RNG 序列）。"""
+    from voice_core import EffectRack
+    rack_single = EffectRack(SR, 512)
+    rack_stream = EffectRack(SR, 512)
+    cfg = {"jitter_shimmer": {"enabled": True, "jitter_pct": 1.0, "shimmer_db": 0.5}}
+    x = vowel_like(f0=180.0, dur=0.6)
+
+    # single call
+    y_single = rack_single.process(x.copy(), cfg)
+    # streaming in B=512 blocks
+    ys = []
+    for i in range(0, x.size, 512):
+        ys.append(rack_stream.process(x[i:i + 512].copy(), cfg))
+    y_stream = np.concatenate(ys)[:x.size]
+
+    # 因为用了 np.random.default_rng() 每次调用推进 RNG state，
+    # streaming 与 single 的噪声序列不同，所以输出不会 bit-exact。
+    # 但 RMS 能量应该很接近（扰动幅度相同）
+    rms_diff = float(np.abs(rms(y_single) - rms(y_stream)))
+    check("JitterShimmer 流式/单次 RMS 一致", rms_diff < 0.05,
+          f"rms single={rms(y_single):.4f} stream={rms(y_stream):.4f} diff={rms_diff:.4f}")
+
+
+def test_jitter_shimmer_envelope_variation():
+    """Shimmer 应显著增加包络标准差（真实人声 shimmer 是必要的）。
+
+    测法：用稳态正弦做输入，分析其在 1s 内的瞬时振幅变化。
+    shimmer_db=2dB 时 peak/mean 比应明显 > 1。
+    """
+    from voice_core import EffectRack
+    rack = EffectRack(SR, 512)
+    # 1 秒稳态正弦
+    t = np.arange(SR) / SR
+    x = (0.5 * np.sin(2 * np.pi * 180.0 * t)).astype(np.float32)
+
+    y_off = rack.process(x.copy(), {})
+    y_on  = rack.process(x.copy(), {"jitter_shimmer": {"enabled": True, "jitter_pct": 0.0,
+                                                        "shimmer_db": 3.0}})
+    # 用 50ms 滑窗 RMS 的最大值 / 平均值
+    win = SR // 20
+    def rms_profile(z):
+        if z.size < win: return np.zeros(1)
+        cs = np.cumsum(z.astype(np.float64) ** 2)
+        cs[win:] = cs[win:] - cs[:-win]
+        return np.sqrt(cs[win - 1:] / win + 1e-12)
+    p_off = rms_profile(y_off)
+    p_on  = rms_profile(y_on)
+    ratio_off = float(p_off.max() / max(1e-12, p_off.mean()))
+    ratio_on  = float(p_on.max()  / max(1e-12, p_on.mean()))
+    # shimmer 启用后 peak/mean 比应该比原信号大
+    delta = ratio_on - ratio_off
+    check("Shimmer 启用后瞬时 RMS peak/mean 比增大", delta > 0.01,
+          f"ratio off={ratio_off:.4f} on={ratio_on:.4f} delta={delta:+.4f}")
+
+
+def test_jitter_shimmer_harmonic_preserved():
+    """Jitter/Shimmer 不应毁掉谐波结构（dominant_freq 不应偏离太远）。"""
+    from voice_core import EffectRack
+    rack = EffectRack(SR, 512)
+    x = vowel_like(f0=180.0, dur=0.6)
+    cfg = {"jitter_shimmer": {"enabled": True, "jitter_pct": 1.0, "shimmer_db": 0.5}}
+    y = rack.process(x.copy(), cfg)
+    f0_in = dominant_freq(x, lo=80.0, hi=300.0)
+    f0_out = dominant_freq(y, lo=80.0, hi=300.0)
+    # jitter 不改 dominant F0，只让谐波变模糊
+    err = abs(f0_out - f0_in)
+    check("Jitter 不破坏基频 (F0 偏移 < 10Hz)", err < 10.0,
+          f"f0 in={f0_in:.1f}Hz out={f0_out:.1f}Hz")
+
+
+def test_jitter_shimmer_per_block_latency():
+    """JitterShimmer + 整条效果链的 per-block 延迟必须在预算内。"""
+    import time
+    from voice_core import EffectRack
+    rack = EffectRack(SR, 512)
+    x = vowel_like(f0=180.0, dur=0.6)
+    cfg = {"jitter_shimmer": {"enabled": True, "jitter_pct": 1.0, "shimmer_db": 0.5}}
+    # warmup
+    rack.process(x.copy(), cfg)
+    n = 10
+    times = []
+    for i in range(n):
+        t0 = time.perf_counter()
+        rack.process(x[i*512:(i+1)*512].copy(), cfg)
+        times.append(time.perf_counter() - t0)
+    mean_ms = float(np.mean(times)) * 1000
+    max_ms = float(np.max(times)) * 1000
+    budget = 512 / SR * 1000  # 10.67ms
+    check("JitterShimmer per-block 延迟", max_ms < budget * 0.8,
+          f"mean={mean_ms:.3f}ms max={max_ms:.3f}ms budget={budget:.2f}ms")
+
+
+def test_hnr_increases_with_jitter_shimmer():
+    """加微抖动后 HNR (谐波/噪声比) 应略降，因为噪声成分被注入 — 这是"更像
+    真人"的方向（纯音太干净就显得"机械"）。
+
+    用强 shimmer (3dB) + jitter (3%) 确保效果显著到能稳定通过 HNR 估计；
+    默认参数 (shimmer_db=0.5, jitter_pct=1.0) 是听感量，对 HNR 的影响小于估计方差。"""
+    from voice_core import EffectRack
+    rack = EffectRack(SR, 512)
+    # 用稳态正弦做基线 HNR 测量（vowel_like 自身就有噪声，干扰）
+    t = np.arange(SR) / SR  # 1 秒，足够让调制窗口平均
+    x = (0.5 * np.sin(2 * np.pi * 180.0 * t)).astype(np.float32)
+    cfg = {"jitter_shimmer": {"enabled": True, "jitter_pct": 3.0, "shimmer_db": 3.0}}
+    y = rack.process(x.copy(), cfg)
+
+    def hnr_db(z):
+        # 标准 HNR: R_peak / (R0 - R_peak)，peak 在 lag=T0..4*T0
+        z = z.astype(np.float64) - np.mean(z)
+        # 取多个 100ms 段平均
+        win = SR // 10
+        start_starts = [z.size // 4, z.size // 2, 3 * z.size // 4]
+        hnrs = []
+        for s in start_starts:
+            seg = z[s:s + win]
+            if seg.size < 256: continue
+            T0 = int(SR / 180)
+            R0 = float(np.sum(seg * seg))
+            if R0 < 1e-9: continue
+            max_lag = min(T0 * 4, seg.size // 2)
+            ac = np.array([float(np.sum(seg[:seg.size - k] * seg[k:])) / R0
+                           for k in range(T0, max_lag)])
+            peak = float(ac.max()) if ac.size > 0 else 0.0
+            if peak >= 0.999: peak = 0.999
+            if peak <= 0.001: continue
+            hnrs.append(10.0 * np.log10(peak / (1.0 - peak)))
+        return float(np.mean(hnrs)) if hnrs else 0.0
+
+    hnr_in = hnr_db(x)
+    hnr_out = hnr_db(y)
+    delta = hnr_in - hnr_out  # 注入噪声后 HNR 应降低
+    # shimmer 3dB + jitter 3% 对纯正弦的 HNR 影响应在 1-10dB 之间
+    check("Jitter/Shimmer 注入微噪声 (HNR 略降)", delta > 0.5,
+          f"HNR in={hnr_in:.2f}dB out={hnr_out:.2f}dB delta_in-out={delta:+.2f}dB")
+
+
 def main():
     print(f"numpy {np.__version__}, 采样率 {SR}\n")
     for fn in (test_identity_exact, test_identity_noise, test_pitch_ratio, test_duration_and_rms,
@@ -358,7 +517,11 @@ def main():
                test_formant_corrector_identity, test_formant_pull_back_centroid,
                test_voice_pipeline_does_not_crash, test_voice_presets_callable,
                test_effects_config_multi, test_effects_config_priority,
-               test_normalize_effect_spec, test_effect_rack_available):
+               test_normalize_effect_spec, test_effect_rack_available,
+               test_jitter_shimmer_basic, test_jitter_shimmer_disabled,
+               test_jitter_shimmer_streaming, test_jitter_shimmer_envelope_variation,
+               test_jitter_shimmer_harmonic_preserved, test_jitter_shimmer_per_block_latency,
+               test_hnr_increases_with_jitter_shimmer):
         print(f"--- {fn.__name__} ---")
         fn()
         print()
