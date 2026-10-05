@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import argparse
 import datetime as _dt
-import json
 import os
 import sys
 import threading
@@ -26,11 +25,11 @@ import voice_core as vc
 
 try:
     import tkinter as tk
-    from tkinter import filedialog, messagebox, simpledialog, ttk
+    from tkinter import filedialog, messagebox, ttk
     TK_IMPORT_ERROR = None
 except Exception as _exc:  # pragma: no cover
     tk = None
-    ttk = filedialog = messagebox = simpledialog = None
+    ttk = filedialog = messagebox = None
     TK_IMPORT_ERROR = _exc
 
 try:
@@ -48,67 +47,6 @@ except Exception as _exc:  # pragma: no cover
     SF_IMPORT_ERROR = _exc
 
 MAX_RECORD_SECONDS = 600  # 录音上限 10 分钟，防止内存爆掉
-
-
-# ------------------------------------------------------------------ 自定义预设
-def user_preset_path():
-    """自定义预设 JSON 存放位置：%APPDATA%/voice-changer/user_presets.json。
-    APPDATA 不存在时退化到 ~/.voice-changer。"""
-    base = os.environ.get("APPDATA") or os.path.expanduser("~/.voice-changer")
-    if base.startswith("~"):
-        base = os.path.expanduser("~/.voice-changer")
-    folder = os.path.join(base, "voice-changer") if os.name == "nt" and "APPDATA" in os.environ else base
-    try:
-        os.makedirs(folder, exist_ok=True)
-    except Exception:
-        return os.path.join(HERE, "user_presets.json")
-    return os.path.join(folder, "user_presets.json")
-
-
-def load_user_presets(path):
-    """读取 JSON 预设文件；损坏或不存在时返回空 dict。
-    schema v1: {"version":1, "presets":{"名字":{"semitones":..,"form_shift":..,"effect":".."}}}
-    schema v2: {"version":1, "presets":{"名字":{"semitones":..,"form_shift":..,"effects_config":{...}}}}"""
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        presets = data.get("presets", {})
-        if not isinstance(presets, dict):
-            return {}
-        # 字段过滤
-        out = {}
-        for name, cfg in presets.items():
-            if not isinstance(cfg, dict):
-                continue
-            try:
-                row = {
-                    "semitones": float(cfg.get("semitones", 0.0)),
-                    "form_shift": float(cfg.get("form_shift", 1.0)),
-                }
-                # 新格式：effects_config 是 dict
-                ec = cfg.get("effects_config")
-                if isinstance(ec, dict):
-                    row["effects_config"] = ec
-                else:
-                    # 旧格式：effect 是字符串
-                    row["effect"] = str(cfg.get("effect", "none"))
-                out[name] = row
-            except Exception:
-                continue
-        return out
-    except FileNotFoundError:
-        return {}
-    except Exception:
-        return {}
-
-
-def save_user_presets(path, presets):
-    """写回 JSON。出错时抛异常让 GUI 弹窗。"""
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump({"version": 1, "presets": presets}, f,
-                  ensure_ascii=False, indent=2)
-    os.replace(tmp, path)
 
 
 # ------------------------------------------------------------------ 辅助
@@ -227,33 +165,24 @@ def load_audio(path: str):
 
 # ------------------------------------------------------------------ 界面
 class VoiceChangerApp:
-    # 实时预设：复用 voice_core.VOICE_PRESETS
-    # 字段：(name, semitones, form_shift_ratio, effect, group)
-    PRESETS = [tuple(p[:4]) for p in vc.VOICE_PRESETS]
-    # 按分组排列 GUI 显示顺序
-    GROUP_ORDER = ("原", "女", "男", "童", "特效")
-    GROUP_LABELS = {
-        "原": "原声",
-        "女": "女性",
-        "男": "男性",
-        "童": "童声",
-        "特效": "特效",
-    }
+    # 实时预设：复用 voice_core.VOICE_PRESETS（semitones, form_shift_ratio, effect）
+    # 把 (semitones, form_shift) 解开给滑块。
+    PRESETS = [
+        (name, semi, fs, eff)
+        for (name, semi, fs, eff) in vc.VOICE_PRESETS
+    ]
 
     def __init__(self, root):
         self.root = root
         root.title("简单变声器 · 实时麦克风变声")
-        root.geometry("780x780")
-        root.minsize(720, 720)
+        root.geometry("720x680")
+        root.minsize(680, 640)
 
         # --- 音频线程只读这些裸属性（避免跨线程访问 tk 变量）---
         self._semitones = 0.0
         self._form_shift = 1.0
         self._gain = 1.0
         self._effect = "none"
-        # 新：多效果组合（dict）。预设是 dict 时设这里；预设是 string 时为 None。
-        # _process_block 调用 pipeline.process 时 effects_config 优先于 _effect。
-        self._effects_config: dict | None = None
         self._formant_on = True
         self._rec_on = False
         self._rec_blocks = []
@@ -270,10 +199,6 @@ class VoiceChangerApp:
         self.recording = False
         self._devices_in = []
         self._devices_out = []
-
-        # 自定义预设：JSON 存到 %APPDATA%/voice-changer/user_presets.json
-        self._user_preset_path = user_preset_path()
-        self._user_presets = load_user_presets(self._user_preset_path)
 
         self._build_ui()
         self.refresh_devices()
@@ -324,49 +249,13 @@ class VoiceChangerApp:
                         variable=self.formant_var, command=self.on_formant_toggle
                         ).grid(row=2, column=0, columnspan=3, sticky="w", padx=8, pady=(0, 6))
 
-        # 预设按钮（按组分行，每行最多 7 个按钮）
-        preset_frame = ttk.LabelFrame(pitch, text=" 预设（点一下切换；可改后再「保存为我的预设」）")
-        preset_frame.grid(row=3, column=0, columnspan=3, sticky="we", padx=6, pady=(0, 6))
-        # 把预设按组归类
-        grouped = {g: [] for g in self.GROUP_ORDER}
-        for entry in vc.VOICE_PRESETS:
-            name, semi, fs, eff, grp = entry
-            grouped[grp].append((name, semi, fs, eff))
-        # 多行排列：每行 7 个按钮，组间换行
-        row = 0
-        col = 0
-        for grp in self.GROUP_ORDER:
-            ttk.Label(preset_frame, text=self.GROUP_LABELS[grp] + ":",
-                      width=6, anchor="e", foreground="#557"
-                      ).grid(row=row, column=col, sticky="e", padx=(6, 2), pady=2)
-            col += 1
-            for name, semi, fs, eff in grouped[grp]:
-                ttk.Button(preset_frame, text=name, width=7,
-                           command=lambda s=semi, f=fs, e=eff, n=name:
-                           self.apply_preset(n, s, f, e)
-                           ).grid(row=row, column=col, padx=1, pady=2)
-                col += 1
-                if col >= 8:
-                    col = 0
-                    row += 1
-            if col != 0:
-                col = 0
-                row += 1
-
-        # 自定义预设：保存 / 加载 / 删除
-        user_frame = ttk.LabelFrame(pitch, text=" 我的预设（保存当前 → 取名 → 下次启动可加载）")
-        user_frame.grid(row=4, column=0, columnspan=3, sticky="we", padx=6, pady=(0, 4))
-        self.user_combo = ttk.Combobox(user_frame, state="readonly", width=20,
-                                       values=self._user_preset_names())
-        self.user_combo.pack(side="left", padx=6, pady=4)
-        ttk.Button(user_frame, text="保存当前为预设…", width=16,
-                   command=self.on_save_user_preset).pack(side="left", padx=3)
-        ttk.Button(user_frame, text="加载", width=6,
-                   command=self.on_load_user_preset).pack(side="left", padx=3)
-        ttk.Button(user_frame, text="删除", width=6,
-                   command=self.on_delete_user_preset).pack(side="left", padx=3)
-        ttk.Button(user_frame, text="打开预设文件…", width=14,
-                   command=self.on_open_preset_file).pack(side="left", padx=3)
+        preset = ttk.Frame(pitch)
+        preset.grid(row=3, column=0, columnspan=3, sticky="w", padx=6, pady=(0, 8))
+        for name, semi, fs, eff in self.PRESETS:
+            ttk.Button(preset, text=name, width=7,
+                       command=lambda s=semi, f=fs, e=eff, n=name:
+                       self.apply_preset(n, s, f, e)
+                       ).pack(side="left", padx=2)
 
         # 音效 / 音量 / 参数
         fx = ttk.LabelFrame(wrap, text=" 音效 · 音量 · 音质 ")
@@ -489,112 +378,20 @@ class VoiceChangerApp:
         self.gain_label.config(text=f"{int(round(g * 100))}%")
 
     def on_effect(self, _=None):
-        """用户手动改 combobox 时同步 _effect 并清掉 _effects_config。"""
         label = self.effect_var.get()
         for key, text in vc.EFFECT_LABELS.items():
             if text == label:
                 self._effect = key
-                self._effects_config = None  # 用户改 combobox → 走 legacy 单效果
                 break
 
     def apply_preset(self, name, semi, form_shift, effect):
-        """套用预设。effect 可以是 str（旧 4 模式）或 dict（新多效果组合）。"""
         self.semi_var.set(semi)
         self.on_semi()
         self.form_var.set(form_shift)
         self.on_form()
-        if isinstance(effect, dict):
-            # 新格式：多效果组合。effect_combobox 仅显示「自定义」，
-            # 实际的 config 走 _effects_config 给音频回调。
-            self._effects_config = effect
-            self.effect_var.set(vc.EFFECT_LABELS["none"])
-            self._effect = "none"
-            n_effects = sum(1 for v in effect.values() if v.get("enabled"))
-            self.status.set(
-                f"已套用预设：{name}（{semi:+.0f} 半音, 共振峰 ×{form_shift:.2f}, "
-                f"{n_effects} 个效果组合）")
-        else:
-            # 旧格式：单效果字符串
-            self._effects_config = None
-            self.effect_var.set(vc.EFFECT_LABELS.get(effect, vc.EFFECT_LABELS["none"]))
-            self._effect = effect if effect in vc.EFFECTS else "none"
-            self.status.set(f"已套用预设：{name}（{semi:+.0f} 半音, 共振峰 ×{form_shift:.2f}）")
-
-    # -------------------------------------------------------------- 我的预设
-    def _user_preset_names(self):
-        return list(self._user_presets.keys())
-
-    def _refresh_user_combo(self):
-        self.user_combo["values"] = self._user_preset_names()
-
-    def on_save_user_preset(self):
-        name = tk.simpledialog.askstring("保存预设", "给当前设置起个名字：", parent=self.root)
-        if not name:
-            return
-        name = name.strip()
-        if not name:
-            return
-        cfg = {
-            "semitones": float(self.semi_var.get()),
-            "form_shift": float(self.form_var.get()),
-        }
-        # 如果用户从预设加载了多效果组合，且没手动改 combobox → 存 dict
-        if self._effects_config is not None:
-            cfg["effects_config"] = self._effects_config
-        else:
-            # legacy 单效果
-            label = self.effect_var.get()
-            eff = "none"
-            for key, text in vc.EFFECT_LABELS.items():
-                if text == label:
-                    eff = key
-                    break
-            cfg["effect"] = eff
-        self._user_presets[name] = cfg
-        try:
-            save_user_presets(self._user_preset_path, self._user_presets)
-            self._refresh_user_combo()
-            self.status.set(f"已保存预设：{name}")
-        except Exception as e:
-            messagebox.showerror("保存失败", f"无法写入 {self._user_preset_path}\n{e}",
-                                 parent=self.root)
-
-    def on_load_user_preset(self):
-        name = self.user_combo.get()
-        if not name or name not in self._user_presets:
-            return
-        cfg = self._user_presets[name]
-        # 兼容旧 JSON（只有 effect）和新 JSON（有 effects_config）
-        eff = cfg.get("effects_config", cfg.get("effect", "none"))
-        self.apply_preset(f"我的「{name}」", cfg["semitones"], cfg["form_shift"], eff)
-
-    def on_delete_user_preset(self):
-        name = self.user_combo.get()
-        if not name or name not in self._user_presets:
-            return
-        if not messagebox.askyesno("删除预设", f"确定要删除预设「{name}」吗？",
-                                   parent=self.root):
-            return
-        del self._user_presets[name]
-        try:
-            save_user_presets(self._user_preset_path, self._user_presets)
-            self._refresh_user_combo()
-            self.user_combo.set("")
-            self.status.set(f"已删除预设：{name}")
-        except Exception as e:
-            messagebox.showerror("删除失败", str(e), parent=self.root)
-
-    def on_open_preset_file(self):
-        # 提示用户文件位置；如果是新文件，先做一次空写入
-        if not os.path.exists(self._user_preset_path):
-            try:
-                save_user_presets(self._user_preset_path, self._user_presets)
-            except Exception:
-                pass
-        try:
-            os.startfile(os.path.dirname(self._user_preset_path))
-        except Exception:
-            messagebox.showinfo("预设文件位置", self._user_preset_path, parent=self.root)
+        self.effect_var.set(vc.EFFECT_LABELS[effect])
+        self.on_effect()
+        self.status.set(f"已套用预设：{name}（{semi:+.0f} 半音, 共振峰 ×{form_shift:.2f}）")
 
     # -------------------------------------------------------------- 启停
     def toggle(self):
@@ -720,17 +517,9 @@ class VoiceChangerApp:
                                                  formant_correct=self._formant_on,
                                                  align=True)
                 self.pipeline.set_effect(self._effect)
-            # 决定走 dict（多效果）还是 str（单效果）：
-            # 有 _effects_config 就用 dict（pipeline.process 会优先用 effects_config）。
-            if self._effects_config is not None:
-                y = self.pipeline.process(x, semitones=self._semitones,
-                                           form_shift_ratio=self._form_shift,
-                                           effect=self._effect,
-                                           effects_config=self._effects_config)
-            else:
-                y = self.pipeline.process(x, semitones=self._semitones,
-                                           form_shift_ratio=self._form_shift,
-                                           effect=self._effect)
+            y = self.pipeline.process(x, semitones=self._semitones,
+                                       form_shift_ratio=self._form_shift,
+                                       effect=self._effect)
             if self._gain != 1.0:
                 y = y * self._gain
             y = np.clip(y, -1.0, 1.0)
