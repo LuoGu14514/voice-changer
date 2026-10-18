@@ -73,3 +73,7 @@ _gsv_venv/
 _wheels/
 models/gsv/
 models/chinese-hubert-base/
+
+# IndexTTS 临时输出
+indextts_*.wav
+_sweep_*.py

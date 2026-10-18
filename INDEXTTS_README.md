@@ -213,9 +213,64 @@ GUI 的 RTF 比 CLI 高（19 vs 11.5），因为 tkinter 事件循环和 worker 
 注意 `models/gsv/v2ProPlus/*/reference_audios/` 是当前唯一的参考音频来源，
 删 `_gsv_*` 目录不影响它。
 
+## 接入 QQ 机器人（nahida-bot-2）
+
+机器人本体在 `D:\nahida-bot-v2\nahida-bot-2`（Python 3.12），而 IndexTTS 要求
+Python >=3.10,<3.12，**两者不能同进程**。因此把引擎包成 HTTP 服务，机器人侧只加一个
+`TtsProvider` 适配器（与仓库里已有的 gpt-sovits-v2 / minimax-t2a-v2 并列）。
+
+### 两条进程
+
+| 进程 | 目录 | 端口 | 启动 |
+|---|---|---|---|
+| IndexTTS 引擎 | `D:\vc`（ASCII junction，中文路径会让 wetext 报 kaldifst 错误） | 9881 | `start_indextts_server.bat` |
+| QQ 机器人 | `D:\nahida-bot-v2\nahida-bot-2` | 6186 (webapi) / 6185 | `restart_bot.ps1` 或 `uv run nahida-bot start --config-yaml config.yaml` |
+
+启动顺序无所谓：引擎模型在后台线程加载（约 50 秒），期间 `/health` 返回
+`loaded:false`、`/tts` 返回 503，机器人侧会把 503 当作**可重试**错误处理。
+
+### 引擎侧接口（`indextts_server.py`，纯标准库 ThreadingHTTPServer）
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/health`、`/api/health` | `{ok, loaded, version, sr, load_s, voices, threads, error}` |
+| GET | `/voices` | 12 条音色（三月七 7 情绪 + 青雀 5 情绪） |
+| POST | `/tts`、`/api/tts`、`/synthesize` | body `{text, ref_audio|voice, lang, duration_factor, diffusion_steps, num_beams, peak_limit}` → `audio/wav` |
+
+成功响应带 `X-Audio-Duration-Ms` / `X-Audio-Sample-Rate` / `X-Audio-Peak` /
+`X-Infer-Ms` / `X-Rtf` / `X-Diffusion-Steps` 头；失败统一
+`{"error":{"code","message"}}`，code 取 `bad_request` / `empty_text` /
+`voice_not_found` / `ref_audio_not_found` / `model_not_ready` / `synthesis_failed`。
+
+`voice` 支持 `角色/情绪`、`角色:情绪`、纯角色名（优先中立）、纯情绪名。
+
+### 机器人侧
+
+- `nahida_bot/speech/providers/indextts.py`：`IndexTTSProvider`，`type = "indextts-v2"`，
+  已注册进 `service.py` 的 `_BUILTIN_PROVIDERS`。
+- `speed` 语义换算：`duration_factor = 1.0 / speed`（IndexTTS 控制的是时长倍数）。
+- 语言优先级沿用仓库既有约定：voice.lang 覆盖 request.text_lang，全空才用 backend.lang；
+  最终统一成两位大写码（`zh`/`zh-CN`/`cmn` → `ZH`）。
+- 配置写在 `config.yaml` 两处：`webapi.speech`（共享 SpeechService，供 WebAPI 用）与顶层
+  `tts:`（speak 插件）。两处用 YAML 锚点 `&tts` / `<<: *tts` 合并，避免重复。
+
+### 三种调用方式
+
+1. QQ 里 `说话 <文本>` 或 `/speak <文本>`（插件命令）
+2. 让模型自己调 `speak` 工具（参数 `text` / `emotion` / `text_lang` / `send` / `caption`）
+3. WebAPI：`POST /api/speech/jobs` → 拿 `download_url` → `GET /api/media/speech/{id}`
+
+### 实测
+
+- 引擎加载 51.6 秒，12 个音色。
+- 走机器人实时服务：青雀 2.95 秒音频耗时 41.4 秒（RTF ≈ 14），130 KB，peak 0.95、无削波。
+- `tests/test_indextts_provider.py` 27 passed；speech 相关既有 8 个测试文件 79 passed。
+- speak 插件端到端（真配置 + 真服务）产出 213 KB wav 并成功挂 voice 附件。
+
 ## 下一步
 
 - [x] CLI 跑通
 - [x] GUI 集成
+- [x] 接入 QQ 机器人（nahida-bot-2）
 - [ ] 实时流式合成（当前是整句离线合成，一句 30-60 秒）
 - [ ] 长文本自动切句，避免单次推理过长
