@@ -34,19 +34,22 @@ _audit_*.py
 *.bak
 *.tmp
 
-# RVC models (large binaries — download separately)
+# RVC models & cache (large binaries — download separately)
 models/*.onnx
 models/*.pth
 models/*.pt
 models/*.index
 models/*.npy
-models/_hubert_dl/           # cached HF/MS model download (huge)
-models/chinese-hubert-base    # symlink to _hubert_dl cache
-models/test_*.wav             # test wav artifacts
-models/voice_demo_*.wav       # voice demo artifacts
-
-# Release artifacts
-voice-changer-v*-source.zip
 # but keep the README
 !models/README.txt
 !models/*.md
+
+# RVC generated outputs (not source code, can be regenerated)
+models/voice_demo_*.wav
+models/test_*.wav
+
+# HuBERT cache (regenerable via _download_hubert.py)
+models/_hubert_dl/
+
+# Release artifacts
+voice-changer-v*-source.zip

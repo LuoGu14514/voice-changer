@@ -81,8 +81,13 @@ class HuBERTExtractor:
         from transformers import AutoFeatureExtractor, HubertModel
         self.device = device
         log.info(f"Loading HuBERT from {model_path}")
-        self.feature_extractor = AutoFeatureExtractor.from_pretrained(model_path)
-        self.model = HubertModel.from_pretrained(model_path).to(device)
+        # local_files_only: don't reach HF when given a local path
+        self.feature_extractor = AutoFeatureExtractor.from_pretrained(
+            model_path, local_files_only=True
+        )
+        self.model = HubertModel.from_pretrained(
+            model_path, local_files_only=True
+        ).to(device)
         self.model.eval()
 
     def extract(self, wav_16k: np.ndarray) -> np.ndarray:
