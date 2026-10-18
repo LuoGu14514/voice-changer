@@ -53,3 +53,23 @@ models/_hubert_dl/
 
 # Release artifacts
 voice-changer-v*-source.zip
+
+# ---- IndexTTS ----
+# 源码 + 模型（8.5 GB）和 3.11 venv 都在本地重建，不入库
+_indextts_src/
+_indextts_venv/
+# 下载/辅助脚本
+_dl_*.py
+# 合成产物
+tts_outputs/
+# 缓存（ModelScope / matplotlib / HF / torch）
+_ms_cache/
+_cache/
+pip-unpack-*/
+
+# ---- GPT-SoVITS（已废弃，留作参考音频来源）----
+_gsv_src/
+_gsv_venv/
+_wheels/
+models/gsv/
+models/chinese-hubert-base/
