@@ -394,6 +394,23 @@ IndexTTS 后端还需要在项目里准备好 `_indextts_venv`（Python 3.11 + I
 
 Key 存在 `%APPDATA%\voice-changer\minimax.json`，也可以用环境变量 `MINIMAX_API_KEY`。
 
+> **⚠️ Key 与域名绑定（实测）**
+>
+> 同一把 MiniMax Key 在 `api.minimax.io` 上会返回 `2049 invalid api key`，
+> 但在 `api.minimaxi.com` 上完全正常 —— 两边的 Key 命名空间不通用。
+> 所以客户端默认是「**自动探测**」：按 `api.minimaxi.com` → `api.minimax.io` →
+> `api.minimax.chat` 的顺序试，撞到 2049 自动换下一个域名重试。
+> 界面上的「域名」下拉框可以手动钉死某一个。
+
+**实测数据**（speech-2.8-turbo，30 个角色预设各合成一次，2026-10-31）：
+
+| 项 | 结果 |
+|---|---|
+| 30 个角色预设 | **30 成功 / 0 失败** |
+| 单条合成耗时 | 0.78 ~ 2.02 s（平均 1.09 s） |
+| 输出格式 | WAV / 32 kHz / 单声道 / 16-bit |
+| `api.minimaxi.com` 系统音色数 | 303 |
+
 ### 30 个角色预设
 
 原项目的 30 个角色（真女声 / 御姐 / 大叔 / 萝莉 / 汤姆猫 / 机器人 / 电话音 …）

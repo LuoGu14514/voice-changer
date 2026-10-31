@@ -88,3 +88,6 @@ _mplcache/
 # 运行时写的日志
 rtc.log
 *.log
+
+# 一次性实测产物目录
+_live_sweep/

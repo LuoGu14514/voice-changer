@@ -52,8 +52,18 @@ __all__ = [
 # 常量
 # --------------------------------------------------------------------------
 
-DEFAULT_BASE_URL = "https://api.minimax.io"
+#: 默认走「自动探测」（见 :data:`BASE_URLS`）
+DEFAULT_BASE_URL = "auto"
 DEFAULT_MODEL = "speech-2.8-turbo"
+
+#: MiniMax 的 API Key **与域名绑定**：同一把 key 在 ``api.minimax.io`` 上会返回
+#: 2049 invalid api key，但在 ``api.minimaxi.com`` 上完全正常（实测）。
+#: 所以默认按顺序探测，遇到 2049 自动换下一个域名。
+BASE_URLS = (
+    "https://api.minimaxi.com",
+    "https://api.minimax.io",
+    "https://api.minimax.chat",
+)
 
 #: 官方全部 speech 模型
 MODELS = (
@@ -323,7 +333,8 @@ class MiniMaxTTS:
         接口密钥。为 None 时依次尝试环境变量 ``MINIMAX_API_KEY`` 和
         ``%APPDATA%/voice-changer/minimax.json`` 里的 ``api_key``。
     base_url : str
-        API 根地址。国内直连慢可以换 ``https://api-uw.minimax.io``。
+        API 根地址。默认 ``auto``，表示在 :data:`BASE_URLS` 里自动探测。
+        也可以显式指定某一个域名。
     model : str
         默认模型，见 :data:`MODELS`。
     timeout : float
@@ -332,7 +343,13 @@ class MiniMaxTTS:
 
     def __init__(self, api_key=None, base_url=DEFAULT_BASE_URL,
                  model=DEFAULT_MODEL, timeout=120):
-        self.base_url = base_url.rstrip("/")
+        self._auto_host = (not base_url) or base_url == "auto"
+        self._hosts = list(BASE_URLS) if self._auto_host else [base_url.rstrip("/")]
+        self._host_idx = 0
+        self.base_url = self._hosts[0]
+        #: 调用方原本指定的域名（"auto" 表示自动探测）。探测成功后
+        #: ``base_url`` 会变成实际用的域名，但这个字段保持不变。
+        self.requested_base_url = "auto" if self._auto_host else self._hosts[0]
         self.model = model
         self.timeout = timeout
         self.api_key = api_key or os.environ.get("MINIMAX_API_KEY", "") or _load_key_from_config()
@@ -341,6 +358,30 @@ class MiniMaxTTS:
                 "缺少 API Key。请设置环境变量 MINIMAX_API_KEY，"
                 "或在 %APPDATA%/voice-changer/minimax.json 写入 {\"api_key\": \"...\"}"
             )
+
+    # ---------------- 域名探测 ----------------
+
+    def _next_host(self):
+        """换到下一个候选域名；没有可换的了就返回 False。
+
+        **MiniMax 的 API Key 与域名是绑定的**（实测）：同一把 key 在
+        ``api.minimax.io`` 上返回 2049 invalid api key，但在
+        ``api.minimaxi.com`` 上完全正常。所以不能写死一个域名。
+        """
+        if self._host_idx + 1 >= len(self._hosts):
+            return False
+        self._host_idx += 1
+        self.base_url = self._hosts[self._host_idx]
+        return True
+
+    def _try_hosts(self, fn, what):
+        """执行 ``fn()``；遇到 2049（key 与域名不匹配）就换域名重试。"""
+        while True:
+            try:
+                return fn()
+            except MiniMaxError as e:
+                if e.code != 2049 or not self._next_host():
+                    raise
 
     # ---------------- 内部工具 ----------------
 
@@ -395,45 +436,56 @@ class MiniMaxTTS:
 
     def _post_json(self, path, payload, timeout=None, what="接口"):
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        req = urllib.request.Request(
-            self.base_url + path, data=data, headers=self._headers(), method="POST"
-        )
-        return self._request(req, timeout=timeout, what=what)
+
+        def _do():
+            req = urllib.request.Request(
+                self.base_url + path, data=data, headers=self._headers(), method="POST"
+            )
+            return self._request(req, timeout=timeout, what=what)
+
+        return self._try_hosts(_do, what)
 
     def _get_json(self, path, params=None, timeout=None, what="接口"):
-        url = self.base_url + path
-        if params:
-            url += "?" + urllib.parse.urlencode(params)
-        req = urllib.request.Request(url, headers=self._headers(), method="GET")
-        return self._request(req, timeout=timeout, what=what)
+        def _do():
+            url = self.base_url + path
+            if params:
+                url += "?" + urllib.parse.urlencode(params)
+            req = urllib.request.Request(url, headers=self._headers(), method="GET")
+            return self._request(req, timeout=timeout, what=what)
+
+        return self._try_hosts(_do, what)
 
     def _post_multipart(self, path, file_field, filename, file_bytes,
-                        content_type, fields=None, timeout=None, what="接口"):
+                         content_type, fields=None, timeout=None, what="接口"):
         """手工拼 multipart/form-data（标准库没有 multipart 编码器）。"""
-        boundary = "----MiniMaxBoundary" + uuid.uuid4().hex
-        body = bytearray()
-        for k, v in (fields or {}).items():
-            body += f"--{boundary}\r\n".encode("utf-8")
-            body += f'Content-Disposition: form-data; name="{k}"\r\n\r\n'.encode("utf-8")
-            body += f"{v}\r\n".encode("utf-8")
-        body += f"--{boundary}\r\n".encode("utf-8")
-        body += (
-            f'Content-Disposition: form-data; name="{file_field}"; '
-            f'filename="{filename}"\r\n'
-        ).encode("utf-8")
-        body += f"Content-Type: {content_type}\r\n\r\n".encode("utf-8")
-        body += file_bytes
-        body += f"\r\n--{boundary}--\r\n".encode("utf-8")
 
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": f"multipart/form-data; boundary={boundary}",
-            "Accept": "application/json",
-        }
-        req = urllib.request.Request(
-            self.base_url + path, data=bytes(body), headers=headers, method="POST"
-        )
-        return self._request(req, timeout=timeout, what=what)
+        def _do():
+            boundary = "----MiniMaxBoundary" + uuid.uuid4().hex
+            body = bytearray()
+            for k, v in (fields or {}).items():
+                body += f"--{boundary}\r\n".encode("utf-8")
+                body += f'Content-Disposition: form-data; name="{k}"\r\n\r\n'.encode("utf-8")
+                body += f"{v}\r\n".encode("utf-8")
+            body += f"--{boundary}\r\n".encode("utf-8")
+            body += (
+                f'Content-Disposition: form-data; name="{file_field}"; '
+                f'filename="{filename}"\r\n'
+            ).encode("utf-8")
+            body += f"Content-Type: {content_type}\r\n\r\n".encode("utf-8")
+            body += file_bytes
+            body += f"\r\n--{boundary}--\r\n".encode("utf-8")
+
+            headers = {
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": f"multipart/form-data; boundary={boundary}",
+                "Accept": "application/json",
+            }
+            req = urllib.request.Request(
+                self.base_url + path, data=bytes(body), headers=headers, method="POST"
+            )
+            return self._request(req, timeout=timeout, what=what)
+
+        return self._try_hosts(_do, what)
 
     def _build_payload(self, text, voice_id, *, model=None, speed=1.0, vol=1.0,
                        pitch=0, emotion=None, sample_rate=32000, fmt="mp3",
@@ -527,12 +579,14 @@ class MiniMaxTTS:
         model, speed, vol, pitch, emotion, sample_rate, fmt, channel, bitrate,
         language_boost, pronunciation_dict, timbre_weights, voice_modify,
         subtitle_enable, subtitle_type, output_format,
-        text_normalization_mode, latex_read
+        text_normalization_mode, latex_read, with_meta
 
         Returns
         -------
         bytes
             音频数据，格式由 ``fmt`` 决定。
+            传 ``with_meta=True`` 时返回 ``(audio_bytes, response_dict)``，
+            里面带 ``extra_info.usage_characters`` 等计费信息。
         """
         if not text or not text.strip():
             raise MiniMaxError("文本为空")
@@ -541,9 +595,11 @@ class MiniMaxTTS:
                 f"文本过长（{len(text)} 字符），同步接口上限 10000 字符；"
                 "请改用异步接口 async_create()"
             )
+        with_meta = bool(kw.pop("with_meta", False))
         payload = self._build_payload(text, voice_id, **kw)
         obj = self._post_json("/v1/t2a_v2", payload, what="语音合成")
-        return self._extract_audio(obj, kw.get("fmt", "mp3"))
+        data = self._extract_audio(obj, kw.get("fmt", "mp3"))
+        return (data, obj) if with_meta else data
 
     def synth_to_file(self, text, voice_id, path, **kw):
         """同步合成并写文件，返回文件路径。"""
@@ -564,45 +620,60 @@ class MiniMaxTTS:
             raise MiniMaxError("文本为空")
         payload = self._build_payload(text, voice_id, stream=True, **kw)
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        req = urllib.request.Request(
-            self.base_url + "/v1/t2a_v2", data=data,
-            headers=self._headers(), method="POST",
-        )
-        try:
-            resp = urllib.request.urlopen(req, timeout=kw.get("timeout", self.timeout))
-        except urllib.error.HTTPError as e:
-            body = e.read()
+
+        def _stream_for(host):
+            req = urllib.request.Request(
+                host + "/v1/t2a_v2", data=data,
+                headers=self._headers(), method="POST",
+            )
             try:
-                obj = json.loads(body.decode("utf-8", "replace"))
-                br = obj.get("base_resp") or {}
-                raise MiniMaxError(
-                    br.get("status_msg") or f"语音合成 HTTP {e.code}",
-                    code=br.get("status_code", e.code), trace_id=obj.get("trace_id"),
-                ) from e
-            except ValueError:
-                raise MiniMaxError(f"语音合成 HTTP {e.code}") from e
-        with resp:
-            for line in resp:
-                line = line.decode("utf-8", "replace").strip()
-                if not line:
-                    continue
-                if line.startswith("data:"):
-                    line = line[5:].strip()
-                if line == "[DONE]":
-                    break
+                resp = urllib.request.urlopen(req, timeout=kw.get("timeout", self.timeout))
+            except urllib.error.HTTPError as e:
+                body = e.read()
                 try:
-                    obj = json.loads(line)
-                except Exception:
-                    continue
-                br = obj.get("base_resp") or {}
-                if br.get("status_code", 0) != 0:
+                    obj = json.loads(body.decode("utf-8", "replace"))
+                    br = obj.get("base_resp") or {}
                     raise MiniMaxError(
-                        br.get("status_msg") or "流式合成失败",
-                        code=br.get("status_code"), trace_id=obj.get("trace_id"),
-                    )
-                chunk = (obj.get("data") or {}).get("audio")
-                if chunk:
-                    yield bytes.fromhex(chunk)
+                        br.get("status_msg") or f"语音合成 HTTP {e.code}",
+                        code=br.get("status_code", e.code), trace_id=obj.get("trace_id"),
+                    ) from e
+                except ValueError:
+                    raise MiniMaxError(f"语音合成 HTTP {e.code}") from e
+            with resp:
+                for line in resp:
+                    line = line.decode("utf-8", "replace").strip()
+                    if not line:
+                        continue
+                    if line.startswith("data:"):
+                        line = line[5:].strip()
+                    if line == "[DONE]":
+                        break
+                    try:
+                        obj = json.loads(line)
+                    except Exception:
+                        continue
+                    br = obj.get("base_resp") or {}
+                    if br.get("status_code", 0) != 0:
+                        raise MiniMaxError(
+                            br.get("status_msg") or "流式合成失败",
+                            code=br.get("status_code"), trace_id=obj.get("trace_id"),
+                        )
+                    chunk = (obj.get("data") or {}).get("audio")
+                    if chunk:
+                        yield bytes.fromhex(chunk)
+
+        # Key 与域名绑定：撞到 2049 就换下一个域名重试
+        while True:
+            host = self._hosts[min(self._host_idx, len(self._hosts) - 1)]
+            self.base_url = host
+            gen = _stream_for(host)
+            try:
+                for chunk in gen:
+                    yield chunk
+                return
+            except MiniMaxError as e:
+                if e.code != 2049 or not self._next_host():
+                    raise
 
     def synth_ws(self, text, voice_id, **kw):
         """WebSocket 同步流式合成，逐块 yield 音频字节。
@@ -631,10 +702,9 @@ class MiniMaxTTS:
             if k in payload:
                 start[k] = payload[k]
 
-        url = self.base_url.replace("https://", "wss://").replace("http://", "ws://")
-        url += "/ws/v1/t2a_v2"
-
-        async def _run():
+        async def _run_for(host):
+            url = host.replace("https://", "wss://").replace("http://", "ws://")
+            url += "/ws/v1/t2a_v2"
             headers = {"Authorization": f"Bearer {self.api_key}"}
             async with websockets.connect(url, additional_headers=headers) as ws:
                 first = json.loads(await ws.recv())
@@ -673,6 +743,19 @@ class MiniMaxTTS:
                     msg = json.loads(await ws.recv())
                     if msg.get("event") == "task_finished":
                         break
+
+        async def _run():
+            # Key 与域名绑定：撞到 2049 就换下一个域名重试
+            while True:
+                host = self._hosts[min(self._host_idx, len(self._hosts) - 1)]
+                self.base_url = host
+                try:
+                    async for chunk in _run_for(host):
+                        yield chunk
+                    return
+                except MiniMaxError as e:
+                    if e.code != 2049 or not self._next_host():
+                        raise
 
         loop = asyncio.new_event_loop()
         try:
@@ -719,10 +802,9 @@ class MiniMaxTTS:
             if k in payload:
                 start[k] = payload[k]
 
-        url = self.base_url.replace("https://", "wss://").replace("http://", "ws://")
-        url += "/ws/v1/t2a_v2_bidi"
-
-        async def _run():
+        async def _run_for(host):
+            url = host.replace("https://", "wss://").replace("http://", "ws://")
+            url += "/ws/v1/t2a_v2_bidi"
             headers = {"Authorization": f"Bearer {self.api_key}"}
             async with websockets.connect(url, additional_headers=headers) as ws:
                 first = json.loads(await ws.recv())
@@ -731,7 +813,11 @@ class MiniMaxTTS:
                 await ws.send(json.dumps(start, ensure_ascii=False))
                 started = json.loads(await ws.recv())
                 if started.get("event") != "task_started":
-                    raise MiniMaxError(f"task_start 失败: {started}", raw=started)
+                    br = started.get("base_resp") or {}
+                    raise MiniMaxError(
+                        br.get("status_msg") or f"task_start 失败: {started}",
+                        code=br.get("status_code"), raw=started,
+                    )
                 for piece in chunks:
                     await ws.send(json.dumps(
                         {"event": "task_continue", "text": piece}, ensure_ascii=False))
@@ -753,6 +839,19 @@ class MiniMaxTTS:
                             br.get("status_msg") or "流式合成失败",
                             code=br.get("status_code"),
                         )
+
+        async def _run():
+            # Key 与域名绑定：撞到 2049 就换下一个域名重试
+            while True:
+                host = self._hosts[min(self._host_idx, len(self._hosts) - 1)]
+                self.base_url = host
+                try:
+                    async for chunk in _run_for(host):
+                        yield chunk
+                    return
+                except MiniMaxError as e:
+                    if e.code != 2049 or not self._next_host():
+                        raise
 
         loop = asyncio.new_event_loop()
         try:

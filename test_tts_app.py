@@ -81,6 +81,8 @@ def test_minimax_preset_lookup(app):
 def test_missing_api_key_raises(app, tmp_path, monkeypatch):
     monkeypatch.delenv("MINIMAX_API_KEY", raising=False)
     monkeypatch.setattr(minimax_tts, "CONFIG_PATH", str(tmp_path / "nope.json"))
+    # 启动时 _load_mm_key() 会把配置里的 Key 填进输入框，这里也要清掉
+    app.ent_key.delete(0, "end")
     with pytest.raises(minimax_tts.MiniMaxError) as ei:
         app._ensure_client()
     assert "API Key" in str(ei.value)

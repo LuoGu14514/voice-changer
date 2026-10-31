@@ -632,3 +632,116 @@ GPT `del` 释放后加载 → 剩 4599 MB → 成功。**不是代码 bug，是�
 - **IndexTTS 的 bf16 彻底化**：绕开上游 CPU 强制 fp32 的逻辑
   （monkeypatch 或传 `device="cpu:0"`），把稳态需求压到 4-5 GB
 - **30 个预设的 A/B 主观听感**：目前映射是按参数直觉配的，没有真实试听对比
+
+## 13. v0.9.1：拿到真 Key 之后的第一次真实调用
+
+前面 12.4 的 MiniMax 客户端全部是**对着 mock server 写的**。用户终于把订阅的
+Key 给了出来（2026-10-31），第一件事就是拿真接口跑一遍 —— 结果**第一把就挂了**。
+
+### 13.1 Key 与域名是绑定的（本次最大的发现）
+
+```
+POST https://api.minimax.io/v1/get_voice
+  -> {"base_resp":{"status_code":2049,"status_msg":"invalid api key"}}
+```
+
+同一个 Key、同一个请求体，换个域名就完全正常：
+
+```
+POST https://api.minimaxi.com/v1/get_voice
+  -> {"system_voice":[{...}], "base_resp":{"status_code":0}}
+```
+
+一开始以为是 Key 过期 / 复制时少了字符 / 鉴权头写错。排查方式是把**三个域名 ×
+三个端点**（`get_voice` / `t2a_v2` / `chatcompletion_v2`）全打一遍：
+
+| 域名 | get_voice | t2a_v2 | chatcompletion_v2 |
+|---|---|---|---|
+| `api.minimax.io` | 2049 | 2049 | 2049 |
+| `api.minimaxi.com` | ✅ | ✅ | ✅ |
+| `api.minimax.chat` | ✅ | ✅ | ✅ |
+
+三个端点全 2049 → 说明是**域名层面的 Key 命名空间**，不是某个接口的问题。
+MiniMax 的 `.io`（新平台）和 `.com`（老平台）用的是两套互不相通的 Key。
+
+**这意味着写死 `https://api.minimax.io` 的客户端，遇到 `.com` 的 Key 就完全不可用。**
+所以改成：默认 `base_url="auto"`，按 `api.minimaxi.com` → `api.minimax.io` →
+`api.minimax.chat` 的顺序试，**撞到 2049 就自动换下一个域名重试**，并把成功
+的那个域名记在 `client.base_url` 上。显式指定域名时不回退（用户既然钉死了就
+尊重他的选择，错误原样抛出）。
+
+### 13.2 回退逻辑要覆盖 4 条路径
+
+不只是同步 HTTP。抽了 `_try_hosts(fn, what)` 包住 `_post_json` / `_get_json` /
+`_post_multipart`；流式和 WebSocket 因为是自己管理连接，得单独包：
+
+| 方法 | 传输 | 2049 怎么出现 | 怎么回退 |
+|---|---|---|---|
+| `synth` / `list_voices` / `clone_voice` … | HTTP | `base_resp.status_code` | `_try_hosts` 统一处理 |
+| `synth_stream` | HTTP SSE | 流**内部**的 `base_resp` | 外层 while 循环重建连接 |
+| `synth_ws` | WebSocket | `task_start` 事件里带 2049 | `_run_for(host)` 逐个 host 试 |
+| `synth_bidi_ws` | WebSocket | 同上 | 同上 |
+
+顺带修了个坑：WebSocket 的 `task_start` 失败分支原本**没带 code**，
+`raise MiniMaxError(f"task_start 失败: {started}")` —— 没有 code 就没法判断
+是不是 2049，也就没法回退。补上 `code=br.get("status_code")` 才让 WS 路径能回退。
+
+### 13.3 30 个角色预设的真实扫描
+
+改完客户端，对 30 个预设各发一次真实请求（`speech-2.8-turbo`，wav / 32 kHz / 单声道）：
+
+| 组 | 角色数 | 成功 | 失败 |
+|---|---|---|---|
+| 原 | 1 | 1 | 0 |
+| 女 | 8 | 8 | 0 |
+| 男 | 7 | 7 | 0 |
+| 童 | 7 | 7 | 0 |
+| 特效 | 7 | 7 | 0 |
+| **合计** | **30** | **30** | **0** |
+
+耗时 0.78 ~ 2.02 s（平均 1.09 s），产物 32 kHz 单声道 WAV。
+`Robot_Armor`（机器人）、`spacious_echo`（幽灵）、`auditorium_echo`（回声）、
+`lofi_telephone`（电话音）这四个用了 `voice_modify.sound_effects` 的也都成了。
+
+**但也暴露了一个假阳性**：之前用官方文档整理的音色表（`.io` 那份）校验过一遍
+「30 个 voice_id 全部命中」，结论是"没问题"。实际上 `.com` 平台的音色表是
+**另一套**，只是恰好包含了全部 30 个 id —— 属于运气，不是验证。
+
+### 13.4 顺带做的两件事
+
+- **`synth(..., with_meta=True)`**：返回 `(音频字节, 完整响应)`，能拿到
+  `extra_info.usage_characters` 等计费信息，方便算成本。
+  顺手发现官方报的是 `usage_characters`（按 Unicode 码点算，10 字的中文报 18）
+  和 `word_count`（10）两个数，计费应该看前者。
+- **GUI 加「域名」下拉框**：默认「自动探测」，也可以手动钉死一个。
+  「测试连接」会在日志里打印**实际生效的域名**，免得用户对着 2049 干瞪眼。
+
+### 13.5 这次踩的测试环境的坑
+
+`test_missing_api_key_raises` 在加了「启动时把配置里的 Key 填进输入框」之后
+**突然挂了** —— 因为开发机上 `%APPDATA%/voice-changer/minimax.json` 里已经有
+真 Key，`_load_mm_key()` 把它填进了 entry，测试只 monkeypatch 了
+`CONFIG_PATH` 却没清 entry。
+
+这不是测试写错了，是**测试环境污染了**：`CONFIG_PATH` 指向真实用户目录，
+而产品代码也会去读它。修法是测试里把 entry 也清掉。更彻底的做法是把
+`CONFIG_PATH` 指到 tmp_path —— 已经这么做了，只是 entry 那条路径也要一起清。
+
+### 13.6 回归测试
+
+| 文件 | 项数 | 结果 |
+|---|---|---|
+| `test_minimax_tts.py` | 47（原 40 + 新 7） | PASS |
+| `test_tts_app.py` | 9 | PASS |
+| **合计** | **56** | **56 PASS / 0 FAIL** |
+
+新增 7 项里有 4 项是**专门测域名回退**的（需要第二个「永远返回 2049」的
+mock server）：
+
+- `test_default_base_url_is_auto`
+- `test_base_urls_cover_minimaxi_and_io`
+- `test_auto_host_falls_back_to_next_host_on_2049`
+- `test_explicit_base_url_does_not_fall_back`
+- `test_all_hosts_bad_raises_2049`
+- `test_synth_with_meta_returns_response`
+- `test_synth_without_meta_returns_bytes`

@@ -196,7 +196,19 @@ class TTSApp:
         self.cb_mm_lang.grid(row=3, column=3, sticky="w", pady=(6, 0))
 
         self.lbl_mm_preset = ttk.Label(self.frm_mm, text="", foreground="#555", wraplength=880)
-        self.lbl_mm_preset.grid(row=4, column=0, columnspan=4, sticky="w", padx=8, pady=(4, 6))
+        self.lbl_mm_preset.grid(row=5, column=0, columnspan=4, sticky="w", padx=8, pady=(4, 6))
+
+        # 接口域名：MiniMax 的 Key 与域名绑定，撞到 2049 会自动换域名重试，
+        # 也可以手动钉死一个（实测 api.minimaxi.com 与 api.minimax.io 的 Key 不通用）
+        ttk.Label(self.frm_mm, text="域名：").grid(row=4, column=0, sticky="w", padx=6, pady=(6, 0))
+        self.cb_mm_host = ttk.Combobox(
+            self.frm_mm, values=["自动探测"] + list(minimax_tts.BASE_URLS),
+            state="readonly", width=30)
+        self.cb_mm_host.set("自动探测")
+        self.cb_mm_host.grid(row=4, column=1, sticky="w", pady=(6, 0))
+        ttk.Label(self.frm_mm, text="（Key 与域名绑定，2049 时自动换域名）",
+                  foreground="#777").grid(row=4, column=2, columnspan=2, sticky="w",
+                                          padx=(18, 0), pady=(6, 0))
 
         # ---- IndexTTS 面板 ----
         self.frm_it = ttk.LabelFrame(self.root, text="IndexTTS 角色")
@@ -400,9 +412,12 @@ class TTSApp:
             raise MiniMaxError(
                 "缺少 API Key。填在上方输入框点「保存」，或设置环境变量 MINIMAX_API_KEY。"
             )
-        if self.mm_client is None or self.mm_client.api_key != key:
+        host = self.cb_mm_host.get().strip()
+        base_url = "auto" if host in ("", "自动探测") else host
+        if (self.mm_client is None or self.mm_client.api_key != key
+                or self.mm_client.requested_base_url != base_url):
             self.mm_client = MiniMaxTTS(
-                api_key=key, model=minimax_tts.DEFAULT_MODEL
+                api_key=key, base_url=base_url, model=minimax_tts.DEFAULT_MODEL
             )
         return self.mm_client
 
@@ -413,7 +428,8 @@ class TTSApp:
             voices = client.list_voices()
             counts = {k: len(v) for k, v in voices.items()
                       if isinstance(v, list) and not k.startswith("base_")}
-            self._log(f"连接成功，音色：{counts}")
+            self._log(f"连接成功，域名：{client.base_url}")
+            self._log(f"音色：{counts}")
             self.lbl_status.configure(text="MiniMax 连接正常", foreground="#0a6")
         except Exception as e:
             self._log(f"[错误] {e}")

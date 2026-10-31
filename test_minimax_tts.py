@@ -451,5 +451,90 @@ def test_load_key_missing_file(tmp_path, monkeypatch):
     assert minimax_tts._load_key_from_config() == ""
 
 
+# ---------------------------------------------------------------- 域名回退
+
+#: 永远返回 2049（invalid api key）的 mock server，模拟「Key 与域名不匹配」
+_BAD_RESP = {"base_resp": {"status_code": 2049, "status_msg": "invalid api key"}}
+
+
+class _BadHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *a):
+        pass
+
+    def _respond(self):
+        length = int(self.headers.get("Content-Length") or 0)
+        if length:
+            self.rfile.read(length)
+        raw = json.dumps(_BAD_RESP).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+    do_GET = _respond
+    do_POST = _respond
+
+
+@pytest.fixture(scope="module")
+def bad_server():
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), _BadHandler)
+    t = threading.Thread(target=httpd.serve_forever, daemon=True)
+    t.start()
+    base = f"http://127.0.0.1:{httpd.server_address[1]}"
+    yield base
+    httpd.shutdown()
+
+
+def test_default_base_url_is_auto():
+    assert minimax_tts.DEFAULT_BASE_URL == "auto"
+
+
+def test_base_urls_cover_minimaxi_and_io():
+    hosts = minimax_tts.BASE_URLS
+    assert "https://api.minimaxi.com" in hosts
+    assert "https://api.minimax.io" in hosts
+
+
+def test_auto_host_falls_back_to_next_host_on_2049(server, bad_server, monkeypatch):
+    """第一个域名返回 2049 时，自动换下一个域名并重试。"""
+    monkeypatch.setattr(minimax_tts, "BASE_URLS", (bad_server, server))
+    c = MiniMaxTTS(api_key="k", base_url="auto")
+    obj = c.list_voices()
+    assert obj["base_resp"]["status_code"] == 0
+    assert c.base_url == server
+    assert c.requested_base_url == "auto"
+
+
+def test_explicit_base_url_does_not_fall_back(bad_server):
+    """显式指定域名时不回退，直接把 2049 抛给调用方。"""
+    c = MiniMaxTTS(api_key="k", base_url=bad_server)
+    with pytest.raises(MiniMaxError) as ei:
+        c.list_voices()
+    assert ei.value.code == 2049
+    assert c.base_url == bad_server
+
+
+def test_all_hosts_bad_raises_2049(bad_server, monkeypatch):
+    monkeypatch.setattr(minimax_tts, "BASE_URLS", (bad_server, bad_server))
+    c = MiniMaxTTS(api_key="k", base_url="auto")
+    with pytest.raises(MiniMaxError) as ei:
+        c.list_voices()
+    assert ei.value.code == 2049
+
+
+def test_synth_with_meta_returns_response(client):
+    data, obj = client.synth("你好", "v1", fmt="wav", with_meta=True)
+    assert isinstance(data, bytes)
+    assert obj["base_resp"]["status_code"] == 0
+    assert obj["trace_id"] == "t-1"
+
+
+def test_synth_without_meta_returns_bytes(client):
+    assert isinstance(client.synth("你好", "v1", fmt="wav"), bytes)
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
