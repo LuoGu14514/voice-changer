@@ -362,3 +362,102 @@ AMD 集显卡上勉强能跑，建议块大小 1024 或更大。
 ### 模型下载（参见 `models/README.txt`）
 
 `models/` 目录有一个 README，详细列了从哪些地方下载模型、推荐选择、文件名建议等。
+
+## 八、文字转语音 TTS（v0.8.0 / v0.9.0 新增）
+
+除了麦克风实时变声，本项目现在还带一个**独立的文字转语音工具** `tts_app.py`：
+输入文字 → 选角色 → 合成语音 → 播放 / 另存。
+
+`tts_app.py` 有 **两个后端**，界面上一个单选框切换：
+
+| 后端 | 特点 | 依赖 | 适合 |
+|---|---|---|---|
+| **MiniMax 云端**（默认） | 快（几秒）、不占本机内存、音色多 | 只需要 API Key，**零第三方依赖** | 日常使用 ✅ |
+| **IndexTTS-2.5 本地** | 离线、能用自己的参考音频克隆音色 | `_indextts_venv` + 5.4 GB 模型 | 无网 / 隐私敏感 |
+
+### 跑起来
+
+```bat
+:: GUI 进程用系统 Python 3.12 就够
+python -m pip install soundfile sounddevice
+python tts_app.py
+```
+
+IndexTTS 后端还需要在项目里准备好 `_indextts_venv`（Python 3.11 + IndexTTS-2.5）
+和 `checkpoints/`（约 5.4 GB）。**不选它就不会加载**，也就不会占那 7.5 GB 内存。
+
+### 用 MiniMax
+
+1. 到 [platform.minimax.io](https://platform.minimax.io) 拿 API Key
+2. 在界面顶部输入框粘贴 → 点「保存」→ 点「测试连接」确认能列出音色
+3. 选角色（下拉框按「原 / 女 / 男 / 童 / 特效」分组）→ 写文本 → 点「合成」
+
+Key 存在 `%APPDATA%\voice-changer\minimax.json`，也可以用环境变量 `MINIMAX_API_KEY`。
+
+### 30 个角色预设
+
+原项目的 30 个角色（真女声 / 御姐 / 大叔 / 萝莉 / 汤姆猫 / 机器人 / 电话音 …）
+在 MiniMax 后端里一一对应到了官方系统音色 + 语速 + 音高 + 情感 + `voice_modify` 特效：
+
+| 组 | 角色 |
+|---|---|
+| 原 | 原声 |
+| 女 | 真女声、御姐、客服女、播音女、少妇、老奶奶、萌妹、嗲嗲 |
+| 男 | 真男声、大叔、磁性男、恶魔、老人、客服男、播音男 |
+| 童 | 萝莉、正太、小孩、娃娃音、小猫、花栗鼠、汤姆猫 |
+| 特效 | 机器人、电音女王、外星人、兽人、幽灵、回声、电话音 |
+
+角色→音色的映射表在 `minimax_tts.py` 的 `MINIMAX_PRESETS`，改一行就能换音色。
+
+### MiniMax API 客户端
+
+`minimax_tts.py` 是**纯标准库**（`urllib.request` + `json`）写的 T2A v2 客户端，零依赖，
+覆盖官方全部 T2A 能力：
+
+```python
+from minimax_tts import MiniMaxTTS
+
+tts = MiniMaxTTS(api_key="sk-xxx")
+
+tts.synth_to_file("你好", "Chinese (Mandarin)_Sweet_Lady", "hi.wav")  # 同步
+for chunk in tts.synth_stream("你好", "Chinese (Mandarin)_Sweet_Lady"):
+    ...                                                              # HTTP 流式
+for chunk in tts.synth_ws("你好", "Chinese (Mandarin)_Sweet_Lady"):
+    ...                                                              # WS 流式（需 websockets）
+tts.async_create(text="长文本", voice_id="v")                        # 异步长文本
+tts.clone_voice("ref.wav", "my-voice-id")                            # 声音克隆
+tts.design_voice("温柔女声", "试听一下")                              # 声音设计
+```
+
+完整的接口说明、参数表、错误码表、定价见 **[docs/MINIMAX_TTS_API.md](docs/MINIMAX_TTS_API.md)**。
+
+### IndexTTS 本地后端
+
+除了 GUI，还有个 HTTP 服务版（方便别的程序调用）：
+
+```bat
+_indextts_venv\Scripts\python.exe indextts_server.py --port 9881
+```
+
+```bash
+curl -X POST http://127.0.0.1:9881/tts -d "text=你好&spk=三月七"
+curl http://127.0.0.1:9881/health
+```
+
+> ⚠️ **内存提醒**：IndexTTS 稳态要吃 ~7.5 GB 内存。这台机器物理内存 15.2 GB、
+> 系统提交量长期在 28 GB 上下，任务管理器里还挂着游戏和 IM，加载阶段会
+> 撞提交上限（表现为 `ACCESS_VIOLATION` 或卡死）。`indextts_engine.py` 做了
+> 两处缓解：`torch.load` 走 `mmap=True`（省掉 3.1 GB 的 checkpoint 副本），
+> 以及把含中文的路径换成 ASCII 别名（`D:\vc`）绕开 mmap 在中文路径上的坑。
+> 这两招能提高成功率，但**根治还是要腾内存**。日常用 MiniMax 云端后端就没事。
+
+### 自测
+
+```bat
+python -m pytest test_minimax_tts.py test_tts_app.py -v
+```
+
+49 项检查，全部离线（本地 mock HTTP server），不发外网请求、不需要 API Key：
+请求体构造、错误码解析、multipart 上传格式、异步接口字段名（`audio_sample_rate`）、
+克隆 voice_id 校验、30 个角色预设与原项目一致、GUI 后端切换等。
+

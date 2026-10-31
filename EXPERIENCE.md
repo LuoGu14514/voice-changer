@@ -453,3 +453,182 @@ self._rng = np.random.default_rng(seed=0xA5C3 ^ id(self))
 - 给 VOICE_PRESETS 每项带附加音效配方（per-preset echo_ms delay 40ms/350ms、tremolo、vibrato、reverb）
   —— 当前 EffectChain 只有 echo_ms=130 默认、phone、robot 三种，要支持 SUONSUN9527 的多参音效需要先扩 EffectChain
 - 实时声码器跑 RVC 轻量版（如果用户能提供目标音色录音）
+
+---
+
+## 12. v0.8 / v0.9：从「实时变声」到「文字转语音」
+
+### 12.1 为什么又转了一次方向
+
+时间线上的三次转向，每次都是同一个原因：**用户要的「像真人」不是 DSP 能给的**。
+
+| 版本 | 路线 | 结果 |
+|---|---|---|
+| v0.1 - v0.5.3 | DSP 实时变声（WSOLA + 共振峰 + 16 效果器） | 音准没问题，但**不像真人**（用户 m01187：「电音和杂音」）→ v0.6.0 回退到 v0.2.0 干净基线 |
+| v0.6 - v0.7.1 | RVC 神经声码（预训练角色模型） | 能克隆音色，但**本机跑不动**：AMD 780M 512MB 无 CUDA，CPU 推理 ~750ms 延迟，且实时场景下延迟不可接受 |
+| v0.8 | IndexTTS-2.5 本地克隆 | 离线可用，但**加载期撞内存提交上限**，长文本任务做不了 |
+
+用户 m01897 明确说「改用 tts」，于是把实时麦克风整条链路拆掉，改成
+「输入文字 → 输出指定音色的语音」。**离线合成没有延迟约束**，这让
+「等 30 秒换一个好音色」变成可接受的交易。
+
+### 12.2 v0.8.0：IndexTTS-2.5 本地引擎
+
+选型对比（详见 `docs/MINIMAX_TTS_API.md` 同级的调研记录）：
+
+- IndexTTS-2.5：0.8B、5 语言、零样本克隆、情感/语速可控、单模型包
+  → 选它是因为**不用拼凑**（cnhubert / BERT / SV / SoVITS base / GPT base 各下各的）
+- GPT-SoVITS v2ProPlus：要 6 个组件、还要 `config.py`（上游仓库里被 gitignore 掉了），
+  且 pip 装 37 个依赖在 Tsinghua 源上反复卡死 → **放弃**
+- Edge-TTS / pyttsx3：质量够但没有「角色音色」概念，跟 30 预设对不上
+
+工程实现：
+
+- `indextts_engine.py` — 封装 `IndexTTS2`，含低内存加载的两处缓解：
+  - `_enable_mmap_torch_load()`：`torch.load` 对 ≥64MB 的 `.pth/.ckpt` 走 `mmap=True`。
+    原因：`gpt.pth` 3.1 GB，默认加载会反序列化出一整份副本再拷进模型，
+    峰值多 3.1 GB 提交量；实测从崩溃变成 0.6 s 成功。
+  - `_ascii_alias()`：把含中文的路径换成指向同目标的 ASCII junction（`D:\vc`）。
+    原因：torch 的 mmap 走 `CreateFileMapping`，在中文路径上有「映射建好但指针不可用」
+    的踩坑表现，`load_state_dict` 里 `copy_` 直接 ACCESS_VIOLATION。
+    实现要点：`os.path.splitdrive(path)[0] + os.sep` —— **必须补 `os.sep`**，
+    否则 `splitdrive` 返回 `"D:"`，扫的是错的目录。
+- `indextts_server.py` — HTTP 服务（`/health`、`/tts`），`faulthandler.enable(all_threads=True)`
+  用来抓加载期的原生崩溃栈
+- `indextts_worker.py` — GUI 进程（3.12）↔ 推理进程（3.11）之间的 JSON-Lines 通道
+
+### 12.3 吞尾音问题的定位（v0.9.0 前置修复）
+
+用户反馈「发送语音消息时会吞掉尾音」。实测 4 段不同长度的合成：
+
+| 时长 | 末 100ms RMS | 末 100ms Peak | 尾静音 |
+|---|---|---|---|
+| 15.4s | 12.9 | 186 | 143 ms |
+| 3.95s | 239 | 1797 | 80.7 ms |
+| 2.43s | 255 | 2251 | 85.0 ms |
+| 1.23s | 3.6 | 12 | 497 ms |
+
+50ms 窗口细查 3.95s 那条：`t-1500~t-1300` 前句残音 → `t-1300~t-1150` 静音 →
+`t-1100~t-150` **持续强语音**（RMS 2000-10000）→ `t-50ms` 突然静音。
+
+根因不在后处理，而在**上游模型**：
+
+- IndexTTS 的 `target_lengths = code_lens * 1.72`，`code_lens` 由 `stop_mel_token`
+  随机采样决定。停止符落得偏早 → mel 帧提前截止 → 最后一个采样点离零很远
+  → 一阶差分在文件末尾出现一个巨大的 step（值 5242 > 5000 判 click）
+- BigVGAN 在 mel 边界处感受野不完整，可能再叠一层突发噪声
+- 上游 `utils/common.py` 其实有 `fade_out_tail`（20ms 升余弦），但 `infer_v2_5.py`
+  走的是 `save_pcm_wav()`，**没调它**
+
+修法：在 `indextts_engine.synthesize` 里，推理结束后读回音频，自己做
+**20ms 升余弦淡出 + 250ms 静音 padding**。升余弦的好处是「到零时斜率也为零」，
+不会引入新的不连续点。
+
+验证（同一段文本）：
+
+| 指标 | 修复前 | 修复后 |
+|---|---|---|
+| 末 100ms Peak / RMS | 1797 / 239 | **0 / 0** |
+| 末 50ms Peak / RMS | 强语音 | **0 / 0** |
+| 尾静音 | 80.7 ms | **361.2 ms** |
+| 末活跃点 | t-50ms（被切） | **t-4.08s** |
+| step_max 21557 位置 | 含文件末尾 | **全在中段**（真实音素过零） |
+
+教训：**排查「声音被截断」要先区分「模型没生成」和「生成完但被切」**。
+前者看时长，后者看末尾波形 —— 一阶差分的 step 是不是孤立在文件边缘，
+是最快的判据。
+
+### 12.4 v0.9.0：MiniMax 云端后端
+
+用户 m04147 要求「查看 minimax 提供的 api 调用 tts，整理出来给我」。
+产出 `docs/MINIMAX_TTS_API.md`（1003 行，17 章），把 T2A v2 的
+同步 HTTP / WS / 双向流式 / 异步 / 克隆 / 声音设计 / 音色管理全部梳理清楚。
+
+然后实现 `minimax_tts.py`。几个刻意的决定：
+
+**1）纯标准库，零第三方依赖。**
+这台机器上 `requests` / `websockets` 有，但 `soundfile` / `sounddevice` 之前是缺的
+（现已装进系统 Python 3.12）。MiniMax 客户端只用 `urllib.request` + `json`，
+保证在任何 Python 3.8+ 环境都能直接跑。WebSocket 那两个方法做成了
+「有 `websockets` 就用，没有就抛明确错误」，而不是硬依赖。
+
+**2）multipart 手工拼。**
+标准库没有 multipart 编码器，所以 `_post_multipart()` 自己拼 boundary
+（`----MiniMaxBoundary` + uuid4hex），字段顺序是 `purpose` 在前、文件在后。
+
+**3）30 个角色预设一对一映射。**
+`MINIMAX_PRESETS` 严格对齐原项目 `voice_core.VOICE_PRESETS` 的 30 个角色名和分组。
+写完后跑测试发现漏了「御姐」，而且「外星人 / 电音女王 / 兽人」被我错分到「女」组
+（它们在原项目里是「特效」组）。**最后是去 git 里 `git show f6e8850:voice_core.py`
+把原始列表抠出来对了一遍才改对** —— 手抄列表必然出错，以 git 历史为准。
+
+每个预设不只是换一个 `voice_id`，还带 `speed` / `vol` / `pitch` / `emotion` /
+`voice_modify`（后者的 `sound_effects` 有 4 个官方取值：spacious_echo /
+auditorium_echo / lofi_telephone / robotic，正好覆盖「幽灵 / 回声 / 电话音 / 机器人」）。
+
+**4）异步接口的字段名不一样。**
+`/v1/t2a_async_v2` 的 `audio_setting` 里采样率叫 `audio_sample_rate`，
+不是同步接口的 `sample_rate`。`async_create()` 里自动做了转换。
+这类「同一个概念两个接口两个字段名」的坑，靠测试固定住最省事。
+
+**5）Tk 不是线程安全的。**
+合成请求放在后台线程，但**所有控件的值必须在 GUI 线程里读出来再传进去**。
+第一版在 worker 里直接 `self.cb_mm_lang.get()`，虽然大多数时候能跑，
+但这是定时炸弹 —— 现在改成 GUI 线程读值 → 构造 client → 传参给 worker。
+
+### 12.5 顺手解决的老问题：内存
+
+v0.8.0 那次 IndexTTS 加载崩溃，根因查清楚了：
+
+- 物理内存 15.2 GB，可用 **0 MB**；提交 34.8 GB / 上限 40.5 GB
+  （`AutomaticManagedPagefile=False`，页面文件手工固定 24.8 GB）
+- 大户：`StarRail` 游戏 priv=5,126 MB（ws 只有 364 MB，大部分已换出）、
+  WorkBuddy ×2、微信、B站
+- 引擎稳态需要 ~7.5 GB：GPT fp32 3.1 + w2v-bert fp32 2.2 + BERT 0.65 +
+  semantic_codec 0.75 + s2mel 0.4 + bigvgan 0.43
+- 上游 `infer_v2_5.py:100-120` 在 CPU 上**强制 `use_bf16 = False`**
+  （`if device is not None: self.use_bf16 = False if device == "cpu" else use_bf16`；
+  不传 device 则走 else 分支同样置 False）→ GPT 实际是 fp32
+
+对照实验（`_probe_mem2.py`）很干脆：GPT 驻留时加载 w2v-bert → 剩 799 MB → AV；
+GPT `del` 释放后加载 → 剩 4599 MB → 成功。**不是代码 bug，是内存提交量耗尽。**
+
+用户明确拒绝了三项「治本」方案（关 StarRail / 扩页面文件 / 减少常驻软件）
+和「服务开机自启」。既然不能动系统，就只能从代码侧挤：
+
+- `torch.load` 走 `mmap=True`（省 3.1 GB 副本）
+- `semantic_model` 转 bf16（省约 1.1 GB），需要配套把 forward 的输入转 bf16、
+  输出 hidden_states 转回 fp32，否则报 `mixed dtype (CPU): expect parameter to
+  have scalar type of Float`
+- `gc.collect()` + `EmptyWorkingSet(-1)` 归还碎页
+
+**这三条都没能彻底解决 —— 加载期仍会撞上限。** 所以 v0.9.0 的产品决策是：
+
+> **默认后端改成 MiniMax 云端。IndexTTS 改成「选中后才懒加载」。**
+
+这一改顺带解决了另一个体验问题：以前 GUI 一启动就拉起 IndexTTS worker，
+加载 30-70 秒、吃 7.5 GB，用户想用云端也躲不掉。现在 `tts_app.py` 默认
+后端是 MiniMax，`IndexTTS worker not autostarted` 也被写成了测试用例。
+
+### 12.6 测试
+
+- `test_minimax_tts.py` — 40 项，全部用本地 `ThreadingHTTPServer` mock，
+  **不发外网请求、不需要 API Key**。覆盖：请求体构造（bitrate 只在 mp3 时出现、
+  可选块的有无）、20 个官方错误码的解析、hex/url 音频提取、multipart 的
+  boundary 与字段顺序、异步接口的 `audio_sample_rate`、克隆 voice_id 的
+  4 类校验、30 个预设与原项目的一致性（含分组）
+- `test_tts_app.py` — 9 项 GUI 冒烟：后端切换的面板显隐、角色下拉 30 项、
+  预设反查、缺 Key 时抛错、**worker 不自动启动**
+- 合计 **49 PASS / 0 FAIL**
+
+一个环境上的坑：GUI 测试里判断「面板有没有显示」不能用 `winfo_ismapped()` ——
+测试时窗口是 `withdraw()` 的，所有子控件的 `ismapped` 恒为 0。
+改用 `winfo_manager()`（返回布局管理名，没被布局则为空串）才对。
+
+### 12.7 还想做的
+
+- **MiniMax 声音克隆接进 GUI**：克隆音色 7 天不用会被系统删，得有个列表管理
+- **双向流式接进 GUI**：服务端自动断句 + 逐句返回，比一次性合成体感好
+- **IndexTTS 的 bf16 彻底化**：绕开上游 CPU 强制 fp32 的逻辑
+  （monkeypatch 或传 `device="cpu:0"`），把稳态需求压到 4-5 GB
+- **30 个预设的 A/B 主观听感**：目前映射是按参数直觉配的，没有真实试听对比

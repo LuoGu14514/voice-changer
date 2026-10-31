@@ -33,6 +33,7 @@
 from __future__ import annotations
 
 import argparse
+import faulthandler
 import json
 import os
 import re
@@ -338,8 +339,13 @@ def serve(
     threads: int | None = None,
     use_qwen_emo: bool = False,
     preload: bool = True,
+    semantic_bf16: bool = False,
 ) -> None:
-    engine = IndexTTSEngine(threads=threads, use_qwen_emo=use_qwen_emo)
+    engine = IndexTTSEngine(
+        threads=threads,
+        use_qwen_emo=use_qwen_emo,
+        semantic_bf16=semantic_bf16,
+    )
     voices = VoiceIndex()
     ready = threading.Event()
     holder: dict[str, str] = {}
@@ -374,6 +380,10 @@ def serve(
 
 
 def main(argv: list[str] | None = None) -> int:
+    # 崩溃时把 C 栈打到 stderr：Windows 上内存耗尽会直接 ACCESS_VIOLATION，
+    # 没有这个的话只能看到 exit code，没有可用信息。
+    faulthandler.enable(all_threads=True)
+
     parser = argparse.ArgumentParser(description="IndexTTS-2.5 本地 HTTP 服务")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=9881)
@@ -388,6 +398,11 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="启动时不预加载模型（/tts 会返回 503）",
     )
+    parser.add_argument(
+        "--semantic-bf16",
+        action="store_true",
+        help="语义编码器用 bf16 加载（省约 1.3 GB 内存，可能有精度损失）",
+    )
     args = parser.parse_args(argv)
 
     serve(
@@ -396,6 +411,7 @@ def main(argv: list[str] | None = None) -> int:
         threads=args.threads or None,
         use_qwen_emo=args.qwen_emo,
         preload=not args.no_preload,
+        semantic_bf16=args.semantic_bf16,
     )
     return 0
 

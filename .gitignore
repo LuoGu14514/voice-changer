@@ -77,3 +77,14 @@ models/chinese-hubert-base/
 # IndexTTS 临时输出
 indextts_*.wav
 _sweep_*.py
+
+# ---- TTS / MiniMax ----
+# 尾音检测调试脚本与产物
+_tail_check.py
+tail_check_*.wav
+_tts_test_out.wav
+# matplotlib 字体缓存
+_mplcache/
+# 运行时写的日志
+rtc.log
+*.log
