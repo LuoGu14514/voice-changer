@@ -71,46 +71,33 @@ def _err(msg, exc=None):
 
 
 def main():
-    # CPU 线程数：默认只有物理核数，这里用满逻辑核
-    nthreads = os.cpu_count() or 8
-    os.environ.setdefault("OMP_NUM_THREADS", str(nthreads))
-    os.environ.setdefault("MKL_NUM_THREADS", str(nthreads))
-
+    # 加载逻辑全部交给 indextts_engine.IndexTTSEngine：
+    #   · torch.load 走 mmap=True，省掉 checkpoint 的整份副本
+    #   · 含中文的 checkpoints 路径换成 ASCII 别名（D:\vc）
+    #   · 语义模型（w2v-bert）bf16 加载，省 ~1.1 GB 提交量
+    #   · 末尾 20ms 升余弦淡出 + 250ms 静音（修「吞尾音」）
+    # 以前 worker 自己写了一份加载代码，上面四条全都拿不到。
     try:
-        import numpy as np
-        import soundfile as sf
-        import torch
-
-        torch.set_num_threads(nthreads)
-
-        import indextts.infer_v2_5 as iv25
-        iv25.DIFFUSION_STEPS = DEFAULT_DIFFUSION_STEPS
-        iv25.CFG_RATE = DEFAULT_CFG_RATE
-        from indextts.infer_v2_5 import IndexTTS2
+        from indextts_engine import IndexTTSEngine
     except Exception as e:
-        _err("import failed", e)
+        _err("import indextts_engine failed", e)
         return 1
 
-    cfg = os.path.join(CHECKPOINTS, "config.yaml")
-    if not os.path.isfile(cfg):
-        _err(f"config.yaml 不存在: {cfg}")
+    try:
+        engine = IndexTTSEngine(use_qwen_emo=False)
+    except Exception as e:
+        _err("engine init failed", e)
         return 1
 
     t0 = time.time()
     try:
-        tts = IndexTTS2(
-            cfg_path=cfg,
-            model_dir=CHECKPOINTS,
-            use_bf16=True,
-            use_cuda_kernel=False,
-            use_torch_compile=False,
-            use_qwen_emo=False,   # GUI 不做情感文本推断，省 1.19 GB 内存
-        )
+        load_s = engine.load()
     except Exception as e:
         _err("model load failed", e)
         return 1
 
-    _send({"ready": True, "load_s": round(time.time() - t0, 1), "sr": 22050})
+    _send({"ready": True, "load_s": round(time.time() - t0, 1),
+           "sr": engine.sample_rate})
 
     for line in sys.stdin:
         line = line.strip()
@@ -137,39 +124,20 @@ def main():
             if not out:
                 raise ValueError("output 为空")
 
-            steps = int(req.get("diffusion_steps") or DEFAULT_DIFFUSION_STEPS)
-            iv25.DIFFUSION_STEPS = steps
-
-            os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
-
-            t1 = time.time()
-            tts.infer(
-                spk_audio_prompt=ref,
-                text=text,
+            info = engine.synthesize(
+                text,
+                ref,
                 lang=req.get("lang") or "ZH",
-                output_path=out,
                 duration_factor=float(req.get("duration_factor") or 1.0),
+                diffusion_steps=int(req.get("diffusion_steps") or DEFAULT_DIFFUSION_STEPS),
                 num_beams=int(req.get("num_beams") or 1),
-                verbose=False,
+                peak_limit=float(req.get("peak_limit") or 0.95),
+                output_path=out,
             )
-            infer_s = time.time() - t1
-
-            # 峰值保护（不同参考音频响度差异会让输出顶到 1.0）
-            data, sr = sf.read(out, dtype="float64")
-            peak = float(np.abs(data).max()) if data.size else 0.0
-            limit = float(req.get("peak_limit") or 0.95)
-            if peak > limit and peak > 0:
-                data = data * (limit / peak)
-                sf.write(out, data, sr, subtype="PCM_16")
-                peak = limit
-                data, sr = sf.read(out)
-
-            dur = len(data) / sr if sr else 0.0
             _send({
-                "id": rid, "ok": True, "output": out,
-                "dur": round(dur, 2), "peak": round(peak, 3),
-                "infer_s": round(infer_s, 1),
-                "rtf": round(infer_s / dur, 2) if dur else None,
+                "id": rid, "ok": True, "output": info["output"],
+                "dur": info["dur"], "peak": info["peak"],
+                "infer_s": info["infer_s"], "rtf": info["rtf"],
             })
         except Exception as e:
             traceback.print_exc(file=sys.stderr)

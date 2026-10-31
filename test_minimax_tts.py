@@ -73,9 +73,13 @@ def server():
 
 
 @pytest.fixture(autouse=True)
-def _clear():
+def _clear(tmp_path, monkeypatch):
     RECORD["requests"].clear()
     RECORD["responses"].clear()
+    # 把自定义角色库指到临时文件：用户真实 %APPDATA% 里如果存了角色，
+    # grouped_presets() 会多出一个「自定义」组，下面的断言就炸了。
+    monkeypatch.setattr(minimax_tts, "CUSTOM_VOICES_PATH",
+                        str(tmp_path / "custom_voices.json"))
     yield
 
 
@@ -534,6 +538,133 @@ def test_synth_with_meta_returns_response(client):
 
 def test_synth_without_meta_returns_bytes(client):
     assert isinstance(client.synth("你好", "v1", fmt="wav"), bytes)
+
+
+# ---------------------------------------------------------------- 自定义角色库
+
+@pytest.fixture
+def custom_store(tmp_path, monkeypatch):
+    """把自定义角色库指到临时文件，别污染用户真实的 %APPDATA%。"""
+    path = tmp_path / "custom_voices.json"
+    monkeypatch.setattr(minimax_tts, "CUSTOM_VOICES_PATH", str(path))
+    return path
+
+
+def test_upload_file_accepts_nested_file_id(client, tmp_path):
+    """实测 MiniMax 返回的是嵌套结构 {"file": {"file_id": ...}}。"""
+    RECORD["responses"]["/v1/files/upload"] = (
+        200, {"base_resp": {"status_code": 0, "status_msg": "success"},
+              "file": {"file_id": 458331960050266, "bytes": 470332,
+                       "filename": "ref.wav", "purpose": "voice_clone"}})
+    wav = tmp_path / "ref.wav"
+    wav.write_bytes(b"RIFF\x00\x00\x00\x00WAVEfmt ")
+    assert client.upload_file(str(wav)) == 458331960050266
+
+
+def test_custom_voices_roundtrip(custom_store):
+    assert minimax_tts.load_custom_voices() == []
+    v = minimax_tts.add_custom_voice(
+        "我的角色", backend="minimax", voice_id="vc-abc12345", source="import",
+        note="云端克隆音色")
+    assert v["name"] == "我的角色"
+    assert v["group"] == minimax_tts.CUSTOM_GROUP
+    assert v["voice_id"] == "vc-abc12345"
+    assert v["created"]
+
+    voices = minimax_tts.load_custom_voices()
+    assert len(voices) == 1
+    assert voices[0]["voice_id"] == "vc-abc12345"
+    assert voices[0]["speed"] == 1.0
+    assert voices[0]["pitch"] == 0
+    assert voices[0]["source"] == "import"
+
+    # 文件确实落盘了
+    assert custom_store.exists()
+    data = json.loads(custom_store.read_text(encoding="utf-8"))
+    assert data["version"] == 1
+    assert data["voices"][0]["name"] == "我的角色"
+
+    assert minimax_tts.get_custom_voice("我的角色")["voice_id"] == "vc-abc12345"
+    assert minimax_tts.remove_custom_voice("我的角色") is True
+    assert minimax_tts.remove_custom_voice("我的角色") is False
+    assert minimax_tts.load_custom_voices() == []
+
+
+def test_add_custom_voice_overwrites_same_name(custom_store):
+    minimax_tts.add_custom_voice("同名", backend="minimax", voice_id="vc-1")
+    minimax_tts.add_custom_voice("同名", backend="minimax", voice_id="vc-2")
+    voices = minimax_tts.load_custom_voices()
+    assert len(voices) == 1
+    assert voices[0]["voice_id"] == "vc-2"
+
+
+def test_add_custom_voice_validates(custom_store):
+    with pytest.raises(ValueError):
+        minimax_tts.add_custom_voice("", backend="minimax", voice_id="vc-1")
+    with pytest.raises(ValueError):
+        minimax_tts.add_custom_voice("x", backend="minimax")           # 缺 voice_id
+    with pytest.raises(ValueError):
+        minimax_tts.add_custom_voice("x", backend="indextts")           # 缺参考音频
+    with pytest.raises(ValueError):
+        minimax_tts.add_custom_voice("x", backend="whatever", voice_id="vc-1")
+
+
+def test_custom_indextts_role_stores_absolute_ref(custom_store, tmp_path):
+    ref = tmp_path / "my.wav"
+    ref.write_bytes(b"RIFF")
+    v = minimax_tts.add_custom_voice("零样本", backend="indextts", ref_audio=str(ref))
+    assert os.path.isabs(v["ref_audio"])
+    assert v["ref_audio"].endswith("my.wav")
+
+
+def test_get_preset_finds_custom_voice(custom_store):
+    assert minimax_tts.get_preset("我的角色") is None
+    minimax_tts.add_custom_voice("我的角色", backend="minimax", voice_id="vc-abc")
+    p = minimax_tts.get_preset("我的角色")
+    assert p is not None
+    assert p["voice_id"] == "vc-abc"
+    # 系统预设不受影响
+    assert minimax_tts.get_preset("萝莉")["group"] == "童"
+
+
+def test_grouped_presets_appends_custom_group_only_when_present(custom_store):
+    groups = minimax_tts.grouped_presets()
+    assert [g for g, _ in groups] == list(minimax_tts.PRESET_GROUPS)
+    assert sum(len(items) for _, items in groups) == 30
+
+    minimax_tts.add_custom_voice("我的角色", backend="minimax", voice_id="vc-abc")
+    groups = minimax_tts.grouped_presets()
+    assert [g for g, _ in groups] == list(minimax_tts.PRESET_GROUPS) + [minimax_tts.CUSTOM_GROUP]
+    assert sum(len(items) for _, items in groups) == 31
+    assert groups[-1][1][0]["name"] == "我的角色"
+
+
+def test_merged_presets_includes_customs(custom_store):
+    assert len(minimax_tts.merged_presets()) == 30
+    minimax_tts.add_custom_voice("我的角色", backend="minimax", voice_id="vc-abc")
+    merged = minimax_tts.merged_presets()
+    assert len(merged) == 31
+    assert merged[-1]["name"] == "我的角色"
+    assert merged[-1]["backend"] == "minimax"
+
+
+def test_load_custom_voices_survives_broken_file(custom_store):
+    custom_store.write_text("{ not json", encoding="utf-8")
+    assert minimax_tts.load_custom_voices() == []
+
+
+def test_list_remote_custom_voices(client):
+    RECORD["responses"]["/v1/get_voice"] = (
+        200, {"base_resp": {"status_code": 0, "status_msg": "success"},
+              "system_voice": [{"voice_id": "sys-1"}],
+              "voice_cloning": [{"voice_id": "vc-1", "name": "克隆甲"}],
+              "voice_generation": [{"voice_id": "ttv-1", "name": "设计乙"}]})
+    remotes = minimax_tts.list_remote_custom_voices(client)
+    ids = {r["voice_id"] for r in remotes}
+    assert ids == {"vc-1", "ttv-1"}
+    assert {r["type"] for r in remotes} == {"voice_cloning", "voice_generation"}
+    # 系统音色不算「自定义」
+    assert "sys-1" not in ids
 
 
 if __name__ == "__main__":

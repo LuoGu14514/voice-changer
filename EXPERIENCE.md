@@ -825,3 +825,216 @@ v0.9.1 zip = 225127 bytes。
 | release id | `429924617` |
 | asset id | `695338457`（225127 bytes）|
 | 回归 | `test_minimax_tts.py` 47 + `test_tts_app.py` 9 + `test_voice_core.py` 14 = **70 PASS / 0 FAIL** |
+
+
+## 15. v0.10.0：「自定义角色」—— 三条路和它们的边界
+
+### 15.1 问题的由来
+
+用户在 v0.9.1 交付后问了一句：**「不可以自定义角色吗」**。
+
+之前 30 个角色是「原项目 v0.4.0 的角色表 → MiniMax 官方系统音色的手工映射」，
+每一项都是写死在 `MINIMAX_PRESETS` 里的。用户想要的是**自己造角色**的能力。
+
+### 15.2 先探测权限，而不是先写代码
+
+拿手上的订阅 Key 逐个打接口，得到一组决定性的事实：
+
+| 接口 | 结果 | 含义 |
+|---|---|---|
+| `/v1/get_voice`（voice_cloning） | 账号里已有 **1 个**克隆音色 `NahidaDesktopTest_20260812_29bc0d2a` | 之前建过 |
+| `/v1/get_voice`（voice_generation） | 0 个 | 没建过设计音色 |
+| `/v1/voice_clone` | **2061** `your current token plan not support model, voice_clone` | **套餐不支持新建克隆** |
+| `/v1/voice_design` | **2061** `... not support model, voice_design` | **套餐不支持新建设计** |
+| `/v1/t2a_v2`（用已有克隆音色） | OK，50676 bytes / 3060 ms | **已有的自定义音色照常能用** |
+| 8 个 TTS 模型 | 全部可用 | 合成能力本身没问题 |
+
+结论很清楚：**这把订阅能「用」自定义音色，不能「造」新的自定义音色**。
+所以「自定义角色」必须拆成三条路，而不是一条。
+
+### 15.3 三条路的分工
+
+| 方式 | 需要什么 | 得到什么 | 成本 | 本机可行性 |
+|---|---|---|---|---|
+| **零样本参考音频** | 一段 3-15 秒干净语音 | 一个新角色，音色来自这段音频 | 本地跑 | **可行**（已实测跑通） |
+| **拉取云端自定义音色** | 账号里已有的克隆/设计音色 | 把它们加进角色库 | 免费 | **可行**（已实测跑通） |
+| **声音克隆 / 声音设计** | 支持该能力的套餐 | 云端新建音色 | 按 MiniMax 规则计费 | **被 2061 挡住**（但保留入口 + 明确提示） |
+
+第三条虽然实测被挡住，**入口还是要留着**：换个套餐就能直接用，
+而且界面上要把 2061 的原因说清楚，不能只丢一个错误码给用户。
+
+### 15.4 IndexTTS 零样本：唯一真正「零训练」的路
+
+IndexTTS 的 `spk_audio_prompt` 本来就是给零样本克隆设计的——引擎侧一直支持
+传任意 `ref_audio`，缺的只是 GUI 上一个「选文件」的入口。
+
+所以这条路的关键不是写新算法，而是**把参考音频变成一个可保存、可复用的角色**。
+
+顺带解决了一个更硬的问题：**本机 IndexTTS 加载一直会崩**。
+
+### 15.5 一个意外收获：semantic bf16 才是崩溃的真凶
+
+§12 记过一次排查：IndexTTS 加载阶段 `exit=-1073741819`（ACCESS_VIOLATION），
+崩在 `transformers` 的 `_load_state_dict_into_meta_model`，
+先后排除了 safetensors 版本、deepspeed 缺失、模型损坏、权限告警，
+最后定性为「**提交量耗尽**」——语义模型 w2v-bert 在 fp32 下要 ~2.2 GB。
+
+当时做了 `_enable_bf16_semantic_model()` + `_patch_semantic_forward()`（进 bf16、
+出 fp32），但**因为更早阶段就崩了，一直没能验证**。
+
+这次重试：
+
+| 条件 | 结果 |
+|---|---|
+| `semantic_bf16=False`（fp32），threads 默认 | `exit=-1073741819`（AV，一如既往） |
+| `semantic_bf16=True`，`threads=4` | **exit=0**，加载成功，合成成功 |
+
+commit 额度当时是 7423 MB 余量，引擎 fp32 稳态要 ~7.5 GB —— 就差那么一点，
+fp32 正好卡在悬崖边上；bf16 把语义模型从 2.2 GB 压到 ~1.1 GB，就过去了。
+
+于是把 `semantic_bf16` 的默认值从 `False` **翻成 `True`**
+（`indextts_engine.py` / `indextts_server.py` 同步），命令行开关从
+`--semantic-bf16` 改成 `--no-semantic-bf16`（默认开，要退回得显式关）。
+
+> 这也解释了为什么「同样的代码有时能跑有时崩」：不是随机，是提交量的函数。
+
+### 15.6 worker 和 engine 重复实现 → 顺手修掉的两个 bug
+
+`indextts_worker.py`（GUI 走的那条路）和 `indextts_server.py` 各自写了一份
+`IndexTTS2` 的加载代码，而 `indextts_engine.py` 里已经有封装好的
+`IndexTTSEngine`。三份实现 → 三种行为：
+
+| 能力 | engine | server | worker |
+|---|---|---|---|
+| `torch.load(mmap=True)` | ✓ | ✓ | ✗ |
+| ASCII 路径别名 | ✓ | ✓ | ✗ |
+| 语义模型 bf16 | ✓ | ✓ | ✗ |
+| **末尾淡出（修吞尾音）** | ✓ | ✓ | **✗** |
+
+最后一条是**真 bug**：§12 那次「吞尾音」的修复（20ms 升余弦淡出 + 250ms 静音）
+只加在 `indextts_engine.py` 上，**GUI 实际用的 worker 根本没走那段代码**——
+所以 GUI 里 IndexTTS 合成出来的东西**尾音还是会被切**。
+
+这次把 worker 改成直接用 `IndexTTSEngine`，四行能力一次性对齐，
+重复实现也少了一份。
+
+> 教训：一个修复如果只落在「被测到的那条路径」上，用户实际用的那条路径等于没修。
+
+### 15.7 本地角色库设计
+
+角色不能只活在内存里，要能存、能改、能导出。选了个纯 JSON：
+
+```
+%APPDATA%oice-changer\custom_voices.json
+{
+  "version": 1,
+  "voices": [
+    {"name": "我的角色", "group": "自定义", "backend": "indextts",
+     "voice_id": "", "ref_audio": "D:\音频\我的角色.wav",
+     "speed": 1.0, "pitch": 0, "emotion": "",
+     "modify": null, "source": "local", "note": "零样本克隆",
+     "created": "2026-10-31 20:00:00"}
+  ]
+}
+```
+
+几个决定：
+
+1. **`backend` 字段决定它出现在哪个后端的角色列表里**。
+   `indextts`（有 `ref_audio`）走本地零样本，`minimax`（有 `voice_id`）走云端。
+   混在一起会出「没有云端音色 ID 却发给 MiniMax」的错，所以 GUI 侧按 backend
+   分流 + 明确拦截。
+2. **`get_preset()` 统一查系统预设和自定义角色**，GUI 侧不用分两套取数逻辑。
+   但 `grouped_presets()` 只在**真的有自定义角色时**才追加「自定义」组，
+   否则 30 个系统预设的分组断言会被打破。
+3. **写文件用 `os.replace()` 原子替换**，避免中途崩溃留下半个 JSON。
+4. 读文件时容错：JSON 坏了就当空列表，不让 GUI 起不来。
+
+### 15.8 顺手修的 upload_file bug
+
+实测 MiniMax `/v1/files/upload` 的响应是**嵌套**的：
+
+```json
+{"file": {"file_id": 458331960050266, "bytes": 470332, "filename": "...", "purpose": "voice_clone"},
+ "base_resp": {"status_code": 0, "status_msg": "success"}}
+```
+
+而原实现取的是顶层的 `obj.get("file_id")` → 拿到 `None` →
+抛「上传成功但没拿到 file_id」。原来的 mock 测试也是按顶层写的，
+所以**测试全绿但真实调用必挂**。
+
+修法是嵌套优先、顶层兜底：
+
+```python
+file_obj = obj.get("file") or {}
+file_id = file_obj.get("file_id", obj.get("file_id"))
+```
+
+并补了一条用真实响应结构的新用例。
+
+> 教训：mock 的响应结构得按**真实**的写，不能照着代码的期望写。
+> 这条 bug 之所以能活这么久，就是因为测试数据和实现共享同一个误解。
+
+### 15.9 下拉框里带「·」的角色名
+
+角色下拉的显示格式是「分组 · 名字」，取名字时原来用
+`label.split("·")[-1]` —— 角色名里自己带「·」就取错了。
+
+改成按已知分组前缀剥离：
+
+```python
+for g in list(PRESET_GROUPS) + [CUSTOM_GROUP, "其它"]:
+    prefix = g + " · "
+    if label.startswith(prefix):
+        return label[len(prefix):].strip()
+```
+
+另外 Windows 文件名保留字符（`< > : " / \ | ? *`）在自定义角色名下会炸，
+补了 `safe_filename()` 清洗后再拼输出路径。
+
+### 15.10 测试
+
+| 文件 | 用例数 |
+|---|---|
+| `test_minimax_tts.py` | 57（新增 10：嵌套 file_id、角色库读写/校验/覆盖、分组追加、merged、坏文件容错、云端音色列举） |
+| `test_tts_app.py` | 17（新增 8：自定义面板控件、IndexTTS 下拉出现自定义角色、`_current_ref` 取自定义音频、MiniMax 下拉出现自定义组、后端错配拦截、Treeview 列表、`name_from_label`、`safe_filename`） |
+| `test_voice_core.py` | 14 |
+| **合计** | **88 PASS / 0 FAIL** |
+
+关键一点：GUI 测试要把 `minimax_tts.CUSTOM_VOICES_PATH` 指到临时文件
+（`monkeypatch` + module 级 `MonkeyPatch`），**否则测试会读用户真实的
+`%APPDATA%`，用户在 GUI 里加过角色就会让「角色下拉有 30 项」的断言炸掉**。
+
+### 15.11 实测数据
+
+**MiniMax 自定义角色**（用账号里已有的克隆音色）：
+
+```
+云端自定义音色: [('NahidaDesktopTest_20260812_29bc0d2a', '克隆')]
+已加入角色库: 娜希达测试 → NahidaDesktopTest_20260812_29bc0d2a
+合成 OK: 213674 bytes  1.06s  时长 3.32s
+分组: [('原',1), ('女',8), ('男',7), ('童',7), ('特效',7), ('自定义',1)]
+```
+
+**IndexTTS 零样本自定义角色**（`indextts_2faff91361e04de29cd87dd0a3392fb4.wav`
+作参考音频，`semantic_bf16=True`, `threads=4`）：
+
+```
+load 成功 → 合成成功
+Total inference time: 141.94 seconds
+Generated audio length: 5.78 seconds
+输出: 6.03s / 22050 Hz / 单声道 / 16-bit / 266044 bytes
+peak 0.950  rms 0.1722
+尾 100ms peak = 0.0000   ← 淡出生效，没有咔哒声
+```
+
+RTF 23.5（CPU 纯推理，5.8 秒音频要 142 秒）—— 本地后端是「准离线」，
+日常还是 MiniMax 云端顺手。
+
+### 15.12 已知限制
+
+- MiniMax 新建克隆/设计音色被套餐挡住（2061）。**已建的音色照常用**。
+- IndexTTS 本地后端吃内存，本机提交余量紧张时仍可能加载失败；
+  `semantic_bf16=True` 把崩溃概率从「基本必崩」降到「基本能成」，但根因
+  （提交上限 40.5 GB、游戏 + IM 常驻）没变。
+- 本地后端 RTF ~23，慢到不适合实时；实时需求还得靠 MiniMax。

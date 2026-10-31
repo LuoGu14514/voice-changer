@@ -32,7 +32,7 @@ import subprocess
 import sys
 import threading
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 
 import numpy as np
 
@@ -94,12 +94,35 @@ def grouped_preset_names():
     return [(g, [p["name"] for p in items]) for g, items in minimax_tts.grouped_presets()]
 
 
+def name_from_label(label):
+    """从「分组 · 名字」的下拉标签里取回角色名。
+
+    角色名本身可能带「·」，所以先按已知分组前缀剥离，再退回按分隔符切。
+    """
+    if not label:
+        return ""
+    for g in list(minimax_tts.PRESET_GROUPS) + [minimax_tts.CUSTOM_GROUP, "其它"]:
+        prefix = g + " · "
+        if label.startswith(prefix):
+            return label[len(prefix):].strip()
+    return label.split("·")[-1].strip()
+
+
+_BAD_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+
+
+def safe_filename(name, fallback="role"):
+    """把角色名转成能安全当文件名的片段（Windows 保留字符都替掉）。"""
+    cleaned = _BAD_FILENAME_CHARS.sub("_", (name or "").strip()).strip(" .")
+    return cleaned[:60] or fallback
+
+
 class TTSApp:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title("TTS 语音合成 · IndexTTS-2.5 / MiniMax")
-        self.root.geometry("940x740")
-        self.root.minsize(820, 620)
+        self.root.geometry("940x900")
+        self.root.minsize(820, 700)
 
         self.backend_var = tk.StringVar(value=BACKEND_MINIMAX)
 
@@ -118,8 +141,8 @@ class TTSApp:
         self.mm_thread = None
 
         self._build_ui()
+        self._refresh_custom_roles()
         self._load_characters()
-        self._load_mm_presets()
         self._load_mm_key()
         self._apply_backend()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -229,6 +252,54 @@ class TTSApp:
         self.lbl_ref = ttk.Label(self.frm_it, text="", foreground="#555", wraplength=880)
         self.lbl_ref.grid(row=1, column=0, columnspan=4, sticky="w", padx=8, pady=(0, 6))
 
+        # ---- 自定义角色 ----
+        # 三条路：
+        #   1) IndexTTS 零样本：任意一段参考音频 = 一个新角色（不用训练、不用云端套餐）
+        #   2) MiniMax 云端音色：拉取账号里已有的克隆/设计音色，直接加入角色库
+        #   3) MiniMax 声音克隆/设计：新建云端音色（需要套餐支持，实测部分订阅会被 2061 挡住）
+        self.frm_custom = ttk.LabelFrame(self.root, text="自定义角色")
+        self.frm_custom.pack(fill="x", **pad)
+
+        ttk.Label(self.frm_custom, text="零样本参考音频：").grid(
+            row=0, column=0, sticky="w", padx=6, pady=6)
+        self.ent_ref = ttk.Entry(self.frm_custom, width=40)
+        self.ent_ref.grid(row=0, column=1, sticky="w")
+        ttk.Button(self.frm_custom, text="浏览…", width=7,
+                   command=self.on_browse_ref).grid(row=0, column=2, padx=6)
+        ttk.Button(self.frm_custom, text="保存为角色", width=11,
+                   command=self.on_save_custom_ref).grid(row=0, column=3, padx=2)
+
+        ttk.Label(self.frm_custom, text="角色名：").grid(
+            row=1, column=0, sticky="w", padx=6, pady=(0, 6))
+        self.ent_custom_name = ttk.Entry(self.frm_custom, width=20)
+        self.ent_custom_name.grid(row=1, column=1, sticky="w", pady=(0, 6))
+        ttk.Button(self.frm_custom, text="拉取云端音色", width=12,
+                   command=self.on_fetch_remote_voices).grid(row=1, column=2, padx=6, pady=(0, 6))
+        ttk.Button(self.frm_custom, text="声音克隆…", width=11,
+                   command=self.on_clone_voice).grid(row=1, column=3, padx=2, pady=(0, 6))
+        ttk.Button(self.frm_custom, text="声音设计…", width=11,
+                   command=self.on_design_voice).grid(row=1, column=4, padx=2, pady=(0, 6))
+
+        cols = ("name", "backend", "target", "source")
+        self.tree_custom = ttk.Treeview(self.frm_custom, columns=cols, height=4,
+                                        show="headings", selectmode="browse")
+        for key, title, width in (("name", "角色名", 150), ("backend", "后端", 80),
+                                  ("target", "音色 ID / 参考音频", 330),
+                                  ("source", "来源", 90)):
+            self.tree_custom.heading(key, text=title)
+            self.tree_custom.column(key, width=width, anchor="w")
+        self.tree_custom.grid(row=2, column=0, columnspan=5, sticky="ew",
+                               padx=6, pady=(6, 0))
+
+        ttk.Button(self.frm_custom, text="设为当前角色", width=12,
+                   command=self.on_use_custom).grid(row=3, column=0, padx=6, pady=6, sticky="w")
+        ttk.Button(self.frm_custom, text="删除本地角色", width=11,
+                   command=self.on_delete_custom).grid(row=3, column=1, padx=2, pady=6, sticky="w")
+        ttk.Button(self.frm_custom, text="删除云端音色", width=11,
+                   command=self.on_delete_remote_voice).grid(row=3, column=2, padx=2, pady=6, sticky="w")
+        self.lbl_custom_hint = ttk.Label(self.frm_custom, text="", foreground="#666")
+        self.lbl_custom_hint.grid(row=3, column=3, columnspan=2, sticky="w", padx=6, pady=6)
+
         # ---- 文本 ----
         mid = ttk.LabelFrame(self.root, text="文本")
         mid.pack(fill="both", expand=True, **pad)
@@ -334,6 +405,15 @@ class TTSApp:
     def _load_characters(self):
         char = self.cb_char.get() or CHARACTERS[0]
         self.cb_char.set(char)
+        custom = minimax_tts.get_custom_voice(char)
+        if custom and custom.get("backend") == "indextts":
+            # 零样本角色：没有情绪包，只有一条参考音频
+            self.emotions = []
+            self.cb_emo.configure(values=[])
+            self.cb_emo.set("")
+            self._show_ref_text()
+            self._log(f"角色 {char}：自定义零样本（{custom.get('ref_audio')}）")
+            return
         self.emotions = list_emotions(char)
         names = [e[0] for e in self.emotions]
         self.cb_emo.configure(values=names)
@@ -349,14 +429,276 @@ class TTSApp:
         for name, path, text in self.emotions:
             if name == emo:
                 return path, text
+        # 零样本自定义角色：参考音频就是角色本身
+        custom = minimax_tts.get_custom_voice(self.cb_char.get() or "")
+        if custom and custom.get("backend") == "indextts":
+            ref = custom.get("ref_audio") or ""
+            return (ref, "") if ref and os.path.isfile(ref) else (None, None)
         return None, None
 
     def _show_ref_text(self):
         path, text = self._current_ref()
         if path:
-            self.lbl_ref.configure(text=f"参考文本：{text}")
+            custom = minimax_tts.get_custom_voice(self.cb_char.get() or "")
+            if custom and custom.get("backend") == "indextts":
+                self.lbl_ref.configure(text=f"零样本参考音频：{path}")
+            else:
+                self.lbl_ref.configure(text=f"参考文本：{text}")
         else:
             self.lbl_ref.configure(text="（没有找到参考音频）")
+
+    # ---------------- 自定义角色 ----------------
+    def _refresh_custom_roles(self):
+        """刷新角色库 Treeview + 两个后端的角色下拉。"""
+        voices = minimax_tts.load_custom_voices()
+        for iid in self.tree_custom.get_children():
+            self.tree_custom.delete(iid)
+        for v in voices:
+            target = v.get("voice_id") or v.get("ref_audio") or ""
+            self.tree_custom.insert(
+                "", "end", iid=v["name"],
+                values=(v["name"], v.get("backend", ""), target, v.get("source", "")),
+            )
+
+        # IndexTTS 角色下拉：内置角色 + 本地的 IndexTTS 自定义角色
+        it_names = list(CHARACTERS) + [
+            v["name"] for v in voices if v.get("backend") == "indextts"
+        ]
+        cur = self.cb_char.get()
+        self.cb_char.configure(values=it_names)
+        if cur in it_names:
+            self.cb_char.set(cur)
+        elif it_names:
+            self.cb_char.set(it_names[0])
+
+        self._load_mm_presets()
+
+    def _selected_custom_name(self):
+        sel = self.tree_custom.selection()
+        return sel[0] if sel else ""
+
+    def on_browse_ref(self):
+        path = filedialog.askopenfilename(
+            title="选一段参考音频（IndexTTS 零样本，3-15 秒最佳）",
+            filetypes=[("音频文件", "*.wav *.mp3 *.m4a *.flac"), ("所有文件", "*.*")],
+        )
+        if path:
+            self.ent_ref.delete(0, "end")
+            self.ent_ref.insert(0, path)
+            if not self.ent_custom_name.get().strip():
+                stem = os.path.splitext(os.path.basename(path))[0]
+                self.ent_custom_name.delete(0, "end")
+                self.ent_custom_name.insert(0, stem)
+
+    def on_save_custom_ref(self):
+        """把选中的参考音频存成一个 IndexTTS 自定义角色（零训练）。"""
+        path = self.ent_ref.get().strip()
+        name = self.ent_custom_name.get().strip()
+        if not path:
+            messagebox.showwarning("缺少参考音频", "先点「浏览…」选一段音频。")
+            return
+        if not os.path.isfile(path):
+            messagebox.showwarning("文件不存在", f"找不到：\n{path}")
+            return
+        if not name:
+            messagebox.showwarning("缺少角色名", "给这个角色起个名字。")
+            return
+        try:
+            minimax_tts.add_custom_voice(
+                name, backend="indextts", ref_audio=path, source="local",
+                note="零样本克隆",
+            )
+        except Exception as e:
+            messagebox.showerror("保存失败", str(e))
+            return
+        self._refresh_custom_roles()
+        self._log(f"已保存自定义角色「{name}」（IndexTTS 零样本）")
+        self.lbl_custom_hint.configure(text=f"已保存「{name}」", foreground="#0a6")
+
+    def on_fetch_remote_voices(self):
+        """拉取账号里已有的 MiniMax 自定义音色（克隆 / 设计）。"""
+        try:
+            client = self._ensure_client()
+        except Exception as e:
+            messagebox.showerror("缺少 API Key", str(e))
+            return
+        try:
+            remotes = minimax_tts.list_remote_custom_voices(client)
+        except MiniMaxError as e:
+            messagebox.showerror("拉取失败", f"[{e.code}] {e}")
+            return
+        except Exception as e:
+            messagebox.showerror("拉取失败", str(e))
+            return
+
+        known = {v.get("voice_id") for v in minimax_tts.load_custom_voices()}
+        added = 0
+        for r in remotes:
+            if r["voice_id"] in known:
+                continue
+            name = r["name"] or r["voice_id"]
+            try:
+                minimax_tts.add_custom_voice(
+                    name, backend="minimax", voice_id=r["voice_id"],
+                    source="import", note=f"云端{r['label']}音色",
+                )
+                added += 1
+            except Exception as e:
+                self._log(f"导入云端音色失败 {r['voice_id']}: {e}")
+        self._refresh_custom_roles()
+        msg = f"云端自定义音色 {len(remotes)} 个，新导入 {added} 个"
+        self._log(msg)
+        self.lbl_custom_hint.configure(text=msg, foreground="#0a6")
+
+    def on_clone_voice(self):
+        """用本地音频在 MiniMax 上新建一个克隆音色（需要套餐支持）。"""
+        try:
+            client = self._ensure_client()
+        except Exception as e:
+            messagebox.showerror("缺少 API Key", str(e))
+            return
+        path = filedialog.askopenfilename(
+            title="选一段音频克隆（10 秒 ~ 5 分钟，≤20MB）",
+            filetypes=[("音频文件", "*.wav *.mp3 *.m4a"), ("所有文件", "*.*")],
+        )
+        if not path:
+            return
+        name = self.ent_custom_name.get().strip() or os.path.splitext(
+            os.path.basename(path))[0]
+        voice_id = "vc-" + "".join(ch for ch in name if ch.isalnum())[:32]
+        voice_id = voice_id if voice_id.startswith("vc") and len(voice_id) >= 8 else "vc-user-voice"
+        try:
+            obj = client.clone_voice(path, voice_id,
+                                     preview_text="你好，这是我的自定义音色试听。")
+        except MiniMaxError as e:
+            if e.code == 2061:
+                messagebox.showwarning(
+                    "套餐不支持声音克隆",
+                    "当前订阅套餐不包含 voice_clone 能力（错误码 2061）。\n\n"
+                    "可以改用：\n"
+                    "· IndexTTS 零样本——任意一段音频直接当新角色（本地，免费，无需训练）\n"
+                    "· 拉取账号里已有的云端自定义音色\n"
+                    "· 升级 MiniMax 套餐",
+                )
+            else:
+                messagebox.showerror("克隆失败", f"[{e.code}] {e}")
+            return
+        except Exception as e:
+            messagebox.showerror("克隆失败", str(e))
+            return
+        minimax_tts.add_custom_voice(
+            name, backend="minimax", voice_id=voice_id, source="clone",
+            note="云端克隆音色",
+        )
+        self._refresh_custom_roles()
+        self._log(f"云端克隆成功：{name} → {voice_id}")
+        self.lbl_custom_hint.configure(text=f"克隆成功「{name}」", foreground="#0a6")
+
+    def on_design_voice(self):
+        """用文字描述在 MiniMax 上设计一个新音色（需要套餐支持）。"""
+        try:
+            client = self._ensure_client()
+        except Exception as e:
+            messagebox.showerror("缺少 API Key", str(e))
+            return
+        prompt = simpledialog.askstring("声音设计", "用一句话描述这个音色：")
+        if not prompt:
+            return
+        name = self.ent_custom_name.get().strip() or prompt[:12]
+        voice_id = "ttv-" + "".join(ch for ch in name if ch.isalnum())[:32]
+        voice_id = voice_id if len(voice_id) >= 8 else "ttv-user-voice"
+        try:
+            obj = client.design_voice(prompt, "你好，这是设计出来的音色试听。",
+                                      voice_id=voice_id)
+        except MiniMaxError as e:
+            if e.code == 2061:
+                messagebox.showwarning(
+                    "套餐不支持声音设计",
+                    "当前订阅套餐不包含 voice_design 能力（错误码 2061）。\n\n"
+                    "可以改用 IndexTTS 零样本，或升级套餐。",
+                )
+            else:
+                messagebox.showerror("设计失败", f"[{e.code}] {e}")
+            return
+        except Exception as e:
+            messagebox.showerror("设计失败", str(e))
+            return
+        got = (obj or {}).get("voice_id") or voice_id
+        minimax_tts.add_custom_voice(
+            name, backend="minimax", voice_id=got, source="design",
+            note=f"云端设计音色：{prompt}",
+        )
+        self._refresh_custom_roles()
+        self._log(f"云端设计成功：{name} → {got}")
+        self.lbl_custom_hint.configure(text=f"设计成功「{name}」", foreground="#0a6")
+
+    def on_use_custom(self):
+        """把选中的自定义角色设为当前后端的当前角色。"""
+        name = self._selected_custom_name()
+        if not name:
+            messagebox.showinfo("提示", "先在下面的列表里选一个角色。")
+            return
+        v = minimax_tts.get_custom_voice(name)
+        if not v:
+            return
+        if self.backend == BACKEND_MINIMAX:
+            if v.get("backend") != "minimax":
+                messagebox.showinfo("提示", "这是 IndexTTS 的角色，先切到 IndexTTS 后端。")
+                return
+            label = f"{minimax_tts.CUSTOM_GROUP} · {name}"
+            self.cb_mm_char.set(label)
+            self._show_mm_preset()
+        else:
+            if v.get("backend") != "indextts":
+                messagebox.showinfo("提示", "这是 MiniMax 的角色，先切到 MiniMax 后端。")
+                return
+            self.cb_char.set(name)
+            self._load_characters()
+        self._log(f"当前角色切到「{name}」")
+
+    def on_delete_custom(self):
+        """删除本地自定义角色。"""
+        name = self._selected_custom_name()
+        if not name:
+            messagebox.showinfo("提示", "先选一个角色。")
+            return
+        if not messagebox.askyesno("删除确认", f"删除本地角色「{name}」？"):
+            return
+        if minimax_tts.remove_custom_voice(name):
+            self._refresh_custom_roles()
+            self._log(f"已删除本地角色「{name}」")
+
+    def on_delete_remote_voice(self):
+        """删除账号里的 MiniMax 云端音色。"""
+        name = self._selected_custom_name()
+        if not name:
+            messagebox.showinfo("提示", "先选一个角色。")
+            return
+        v = minimax_tts.get_custom_voice(name)
+        if not v or v.get("backend") != "minimax":
+            messagebox.showinfo("提示", "这个角色不是云端音色。")
+            return
+        try:
+            client = self._ensure_client()
+        except Exception as e:
+            messagebox.showerror("缺少 API Key", str(e))
+            return
+        vtype = "voice_generation" if v.get("source") == "design" else "voice_cloning"
+        if not messagebox.askyesno(
+            "删除确认", f"删除云端音色「{name}」（{v['voice_id']}）？此操作不可撤销。"
+        ):
+            return
+        try:
+            client.delete_voice(v["voice_id"], vtype)
+        except MiniMaxError as e:
+            messagebox.showerror("删除失败", f"[{e.code}] {e}")
+            return
+        except Exception as e:
+            messagebox.showerror("删除失败", str(e))
+            return
+        minimax_tts.remove_custom_voice(name)
+        self._refresh_custom_roles()
+        self._log(f"已删除云端音色「{name}」")
 
     # ---------------- MiniMax ----------------
     def _load_mm_presets(self):
@@ -373,10 +715,14 @@ class TTSApp:
 
     def _show_mm_preset(self):
         label = self.cb_mm_char.get()
-        name = label.split("·")[-1].strip() if label else ""
+        name = name_from_label(label)
         p = minimax_tts.get_preset(name)
         if not p:
             self.lbl_mm_preset.configure(text="")
+            return
+        if p.get("backend") == "indextts":
+            self.lbl_mm_preset.configure(
+                text=f"{p['name']}｜这是 IndexTTS 零样本角色，请切到 IndexTTS 后端使用")
             return
         self.lbl_mm_preset.configure(
             text=f"{p['name']}｜音色 {p['voice_id']}"
@@ -623,10 +969,17 @@ class TTSApp:
 
     def _on_synth_minimax(self, text):
         label = self.cb_mm_char.get()
-        name = label.split("·")[-1].strip() if label else ""
+        name = name_from_label(label)
         preset = minimax_tts.get_preset(name)
         if not preset:
             messagebox.showwarning("没有角色", "请选择一个角色预设。")
+            return
+        if preset.get("backend") == "indextts":
+            messagebox.showinfo(
+                "后端不对",
+                f"「{preset['name']}」是 IndexTTS 零样本角色（只有参考音频，没有云端音色 ID）。\n"
+                "请切到 IndexTTS 后端使用它。",
+            )
             return
         if len(text) >= 10000:
             messagebox.showwarning(
@@ -637,7 +990,7 @@ class TTSApp:
 
         os.makedirs(OUTPUT_DIR, exist_ok=True)
         stamp = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-        out = os.path.join(OUTPUT_DIR, f"mm_{preset['name']}_{stamp}.wav")
+        out = os.path.join(OUTPUT_DIR, f"mm_{safe_filename(preset['name'])}_{stamp}.wav")
 
         self.req_id += 1
         self.pending_id = self.req_id
@@ -681,7 +1034,7 @@ class TTSApp:
 
         os.makedirs(OUTPUT_DIR, exist_ok=True)
         stamp = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-        out = os.path.join(OUTPUT_DIR, f"{self.cb_char.get()}_{stamp}.wav")
+        out = os.path.join(OUTPUT_DIR, f"{safe_filename(self.cb_char.get())}_{stamp}.wav")
 
         self.req_id += 1
         self.pending_id = self.req_id

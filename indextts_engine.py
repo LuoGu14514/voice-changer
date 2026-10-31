@@ -264,11 +264,15 @@ class IndexTTSEngine:
         use_qwen_emo: bool = False,
         threads: int | None = None,
         use_bf16: bool = True,
-        semantic_bf16: bool = False,
+        semantic_bf16: bool = True,
     ) -> None:
         self.checkpoints_dir = checkpoints_dir or CHECKPOINTS
         self.use_qwen_emo = use_qwen_emo
         self.use_bf16 = use_bf16
+        # 语义模型（w2v-bert）默认走 bf16：fp32 时它要占 ~2.2 GB 提交量，
+        # 在这台提交上限 40 GB、常态余量 5-7 GB 的机器上，加载阶段会直接
+        # ACCESS_VIOLATION（实测 exit=-1073741819）。bf16 把它压到 ~1.1 GB，
+        # 同样条件下能稳定加载并合成（见 EXPERIENCE.md §15）。
         self.semantic_bf16 = semantic_bf16
         self.threads = bootstrap_env(threads)
         self._tts = None

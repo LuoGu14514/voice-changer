@@ -46,6 +46,14 @@ __all__ = [
     "DEFAULT_BASE_URL",
     "CONFIG_DIR",
     "CONFIG_PATH",
+    "CUSTOM_VOICES_PATH",
+    "CUSTOM_GROUP",
+    "load_custom_voices",
+    "save_custom_voices",
+    "add_custom_voice",
+    "remove_custom_voice",
+    "get_custom_voice",
+    "merged_presets",
 ]
 
 # --------------------------------------------------------------------------
@@ -97,6 +105,12 @@ CONFIG_DIR = os.path.join(
     os.environ.get("APPDATA", os.path.expanduser("~")), "voice-changer"
 )
 CONFIG_PATH = os.path.join(CONFIG_DIR, "minimax.json")
+
+#: 本地自定义角色库（自己加的角色，和 30 个系统预设放在一起用）
+CUSTOM_VOICES_PATH = os.path.join(CONFIG_DIR, "custom_voices.json")
+
+#: 自定义角色在 GUI 分组下拉里的组名
+CUSTOM_GROUP = "自定义"
 
 
 # --------------------------------------------------------------------------
@@ -914,7 +928,10 @@ class MiniMaxTTS:
             "/v1/files/upload", "file", os.path.basename(audio_path),
             data, ctype, fields={"purpose": purpose}, what="文件上传",
         )
-        file_id = obj.get("file_id")
+        # 实测响应结构是嵌套的：{"file": {"file_id": 458331960050266, ...}}
+        # 顶层偶尔也会直接给 file_id，两种都兼容。
+        file_obj = obj.get("file") or {}
+        file_id = file_obj.get("file_id", obj.get("file_id"))
         if file_id is None:
             raise MiniMaxError("上传成功但没拿到 file_id", raw=obj)
         return file_id
@@ -1109,15 +1126,21 @@ def save_key_to_config(api_key, **extra):
 
 
 def get_preset(name):
-    """按名字取角色预设，找不到返回 None。"""
+    """按名字取角色预设，找不到返回 None。
+
+    先查 30 个系统预设，再查本地自定义角色库。
+    """
     for p in MINIMAX_PRESETS:
         if p["name"] == name:
             return p
-    return None
+    return get_custom_voice(name)
 
 
 def grouped_presets():
-    """返回 ``[(分组名, [预设, ...]), ...]``，便于 GUI 做分组下拉。"""
+    """返回 ``[(分组名, [预设, ...]), ...]``，便于 GUI 做分组下拉。
+
+    有本地自定义角色时，末尾追加一组「自定义」。
+    """
     out = []
     for g in PRESET_GROUPS:
         items = [p for p in MINIMAX_PRESETS if p["group"] == g]
@@ -1126,6 +1149,177 @@ def grouped_presets():
     leftover = [p for p in MINIMAX_PRESETS if p["group"] not in PRESET_GROUPS]
     if leftover:
         out.append(("其它", leftover))
+    customs = load_custom_voices()
+    if customs:
+        out.append((CUSTOM_GROUP, customs))
+    return out
+
+
+# --------------------------------------------------------------------------
+# 本地自定义角色库
+# --------------------------------------------------------------------------
+
+def _now_stamp():
+    import datetime
+    return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def load_custom_voices():
+    """读本地自定义角色库。
+
+    返回 ``[角色 dict, ...]``；文件不存在或坏了就返回空列表（不抛异常）。
+    每个角色的字段::
+
+        {
+            "name":      "显示名（唯一）",
+            "group":     "自定义",
+            "backend":   "minimax" | "indextts",
+            "voice_id":  "MiniMax 音色 ID"（indextts 为空）,
+            "ref_audio": "IndexTTS 参考音频路径"（minimax 为空）,
+            "speed":     1.0, "pitch": 0, "emotion": "",
+            "modify":    None,          # MiniMax voice_modify
+            "note":      "备注",
+            "source":    "local" | "clone" | "design" | "import",
+            "created":   "2026-10-31 20:00:00",
+        }
+    """
+    try:
+        with open(CUSTOM_VOICES_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return []
+    voices = data.get("voices") if isinstance(data, dict) else data
+    if not isinstance(voices, list):
+        return []
+    out = []
+    for v in voices:
+        if isinstance(v, dict) and v.get("name"):
+            item = dict(v)
+            item.setdefault("group", CUSTOM_GROUP)
+            item.setdefault("backend", "minimax")
+            item.setdefault("voice_id", "")
+            item.setdefault("ref_audio", "")
+            item.setdefault("speed", 1.0)
+            item.setdefault("pitch", 0)
+            item.setdefault("emotion", "")
+            item.setdefault("modify", None)
+            item.setdefault("note", "")
+            item.setdefault("source", "local")
+            item.setdefault("created", "")
+            out.append(item)
+    return out
+
+
+def save_custom_voices(voices):
+    """把自定义角色列表写回本地库，返回文件路径。"""
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    payload = {"version": 1, "voices": list(voices)}
+    tmp = CUSTOM_VOICES_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, CUSTOM_VOICES_PATH)
+    return CUSTOM_VOICES_PATH
+
+
+def add_custom_voice(name, *, backend="minimax", voice_id="", ref_audio="",
+                     speed=1.0, pitch=0, emotion="", modify=None,
+                     note="", source="local"):
+    """新增（或覆盖）一个自定义角色，返回存下来的角色 dict。
+
+    名字重复时直接覆盖同名角色。
+    """
+    name = (name or "").strip()
+    if not name:
+        raise ValueError("角色名不能为空")
+    if backend not in ("minimax", "indextts"):
+        raise ValueError("backend 只能是 minimax 或 indextts")
+    if backend == "minimax" and not voice_id:
+        raise ValueError("MiniMax 角色必须给 voice_id")
+    if backend == "indextts" and not ref_audio:
+        raise ValueError("IndexTTS 角色必须给参考音频路径")
+
+    voices = load_custom_voices()
+    item = {
+        "name": name,
+        "group": CUSTOM_GROUP,
+        "backend": backend,
+        "voice_id": voice_id or "",
+        "ref_audio": os.path.abspath(ref_audio) if ref_audio else "",
+        "speed": float(speed or 1.0),
+        "pitch": int(pitch or 0),
+        "emotion": emotion or "",
+        "modify": modify,
+        "note": note or "",
+        "source": source or "local",
+        "created": _now_stamp(),
+    }
+    for i, v in enumerate(voices):
+        if v.get("name") == name:
+            item["created"] = v.get("created") or item["created"]
+            voices[i] = item
+            break
+    else:
+        voices.append(item)
+    save_custom_voices(voices)
+    return item
+
+
+def remove_custom_voice(name):
+    """删掉一个本地自定义角色，返回是否真的删掉了。"""
+    voices = load_custom_voices()
+    keep = [v for v in voices if v.get("name") != name]
+    if len(keep) == len(voices):
+        return False
+    save_custom_voices(keep)
+    return True
+
+
+def get_custom_voice(name):
+    """按名字取本地自定义角色，找不到返回 None。"""
+    for v in load_custom_voices():
+        if v.get("name") == name:
+            return v
+    return None
+
+
+def merged_presets():
+    """30 个系统预设 + 本地自定义角色，统一成预设 dict 结构。
+
+    IndexTTS 的自定义角色没有 voice_id，用它走 MiniMax 合成会失败，
+    所以 GUI 里要按 ``backend`` 分流。
+    """
+    out = [dict(p) for p in MINIMAX_PRESETS]
+    for v in load_custom_voices():
+        item = dict(v)
+        item.setdefault("group", CUSTOM_GROUP)
+        out.append(item)
+    return out
+
+
+def list_remote_custom_voices(client, voice_type="all"):
+    """列账号里已有的自定义音色（克隆 / 设计），返回 ``[dict, ...]``。
+
+    ``voice_type`` 取 ``"voice_cloning"`` / ``"voice_generation"`` /
+    ``"all"``；``all`` 时两类合并。每项::
+
+        {"voice_id": ..., "name": ..., "type": "voice_cloning", "raw": {...}}
+    """
+    obj = client.list_voices(voice_type)
+    out = []
+    for key, label in (("voice_cloning", "克隆"), ("voice_generation", "设计")):
+        for item in obj.get(key) or []:
+            if not isinstance(item, dict):
+                continue
+            vid = item.get("voice_id") or item.get("voiceId")
+            if not vid:
+                continue
+            out.append({
+                "voice_id": vid,
+                "name": item.get("name") or item.get("description") or vid,
+                "type": key,
+                "label": label,
+                "raw": item,
+            })
     return out
 
 

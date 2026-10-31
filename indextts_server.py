@@ -339,7 +339,7 @@ def serve(
     threads: int | None = None,
     use_qwen_emo: bool = False,
     preload: bool = True,
-    semantic_bf16: bool = False,
+    semantic_bf16: bool = True,
 ) -> None:
     engine = IndexTTSEngine(
         threads=threads,
@@ -399,9 +399,9 @@ def main(argv: list[str] | None = None) -> int:
         help="启动时不预加载模型（/tts 会返回 503）",
     )
     parser.add_argument(
-        "--semantic-bf16",
+        "--no-semantic-bf16",
         action="store_true",
-        help="语义编码器用 bf16 加载（省约 1.3 GB 内存，可能有精度损失）",
+        help="语义编码器改回 fp32 加载（默认 bf16：省约 1.1 GB 提交量，避免加载阶段崩溃）",
     )
     args = parser.parse_args(argv)
 
@@ -411,7 +411,7 @@ def main(argv: list[str] | None = None) -> int:
         threads=args.threads or None,
         use_qwen_emo=args.qwen_emo,
         preload=not args.no_preload,
-        semantic_bf16=args.semantic_bf16,
+        semantic_bf16=not args.no_semantic_bf16,
     )
     return 0
 
