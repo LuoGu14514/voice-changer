@@ -745,3 +745,83 @@ mock server）：
 - `test_all_hosts_bad_raises_2049`
 - `test_synth_with_meta_returns_response`
 - `test_synth_without_meta_returns_bytes`
+
+---
+
+## 14. 发布会话里的网络 / git / 编码踩坑
+
+v0.9.1 收尾时把发布流程重跑了一遍，踩到的坑都记在这里。
+
+### 14.1 github.com 的 geo-DNS 答案在这台机器上不通
+
+| 主机 | DNS 答案 | 443 实测 |
+|---|---|---|
+| `github.com` | 20.205.243.166 | **TCP 超时** |
+| `api.github.com` | 20.205.243.168 | 正常（`/rate_limit` → 200）|
+| `uploads.github.com` | 20.205.243.161 | 正常（POST asset → 201）|
+
+症状：`git push` 报
+`fatal: unable to access '...': Failed to connect to github.com port 443 after 21084 ms`。
+
+解法（git 2.53 支持 `http.curloptResolve`）：
+
+```bat
+git -C D:\代码\voice_changer ^
+    -c "http.curloptResolve=github.com:443:140.82.112.3" push origin main
+```
+
+**web 主机和 API 主机必须用两套地址。** 我一开始图省事，把
+`api.github.com` / `uploads.github.com` 也一起 remap 到 `140.82.112.5`，
+结果 `POST /releases/{id}/assets` 一律返回 JSON 的 `404 Not Found`：
+
+- `140.82.112.3` 对 `api.github.com` 返回 `301 → https://github.com/...`（web 边缘）
+- `140.82.112.5` 对 `api.github.com` 返回 200（API 边缘），但**没有实现 asset 上传路由**
+- `uploads.github.com` 用**普通 DNS**（20.205.243.161）直接 POST → `HTTP 201`
+
+所以最终方案是：**git 走 curloptResolve，API / 上传走普通 DNS**。
+
+### 14.2 `D:\代码` 和 `D:\代码\voice_changer` 是两个 git 仓库
+
+- 父仓库 `D:/代码`：**一个 commit 都没有**（branch `master`，无 remote），里面混着几十个别的项目（cablecar / qisheng-chess / ElytraRing / sanxiang / elytra_* …）
+- 子仓库 `D:/代码/voice_changer`：本项目，remote = `github.com/LuoGu14514/voice-changer`
+
+`git status` 一定要带 `-C "D:\代码\voice_changer"`。
+我一度把 `_live_sweep/` 写进了**父仓库**的 `.gitignore`（9 行 → 10 行）。
+
+### 14.3 PowerShell 控制台是 GBK，读 UTF-8 会吃掉换行
+
+`Get-Content` 读 UTF-8 中文文件时乱码，而且**会把换行吃掉** —— GBK 双字节解码把
+`0x0A` 当成某个字的第二个字节吃掉了，看起来像两行并成一行：
+
+```
+# 运行时写的日志?rtc.log        <- 实际文件里是正确换行，终端显示成一行
+```
+
+改文件一律用：
+
+```powershell
+$enc = New-Object System.Text.UTF8Encoding($false)
+[System.IO.File]::WriteAllText($p, $txt, $enc)
+```
+
+同理，`curl -d '{"name":"…中文…"}'` 也会被控制台编码搞坏，GitHub 回
+`400 Problems parsing JSON`。参数里有中文时走 Python + urllib，别走 curl。
+
+### 14.4 `git archive` 打包源码 zip
+
+```bat
+git archive --format=zip --prefix=voice-changer-v0.9.1/ -o voice-changer-v0.9.1-source.zip HEAD
+```
+
+只含 **tracked** 文件，12 GB 的模型 / `_indextts_venv` / `models/` 天然不会泄漏。
+v0.9.1 zip = 225127 bytes。
+
+### 14.5 v0.9.1 发布结果
+
+| 项 | 值 |
+|---|---|
+| commit | `4604736` |
+| tag | `v0.9.1` |
+| release id | `429924617` |
+| asset id | `695338457`（225127 bytes）|
+| 回归 | `test_minimax_tts.py` 47 + `test_tts_app.py` 9 + `test_voice_core.py` 14 = **70 PASS / 0 FAIL** |
