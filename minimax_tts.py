@@ -233,7 +233,6 @@ def _preset(name, group, voice_id, speed=1.0, vol=1.0, pitch=0,
 
 
 #: 本项目 30 个角色预设 → MiniMax 系统音色
-#: 本项目 30 个角色预设 -> MiniMax 系统音色
 #: 角色名与分组严格对齐原项目 voice_core.VOICE_PRESETS (v0.4.0 起)
 MINIMAX_PRESETS = [
     # ---- 原声 / 基础 (1) ----
